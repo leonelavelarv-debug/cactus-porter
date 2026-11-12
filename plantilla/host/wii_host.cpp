@@ -6,6 +6,9 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include "dev_di.h"
+#include "dev_fs.h"
+#include "guest_memory.h"
 #include "wii_dvd.h"
 #include "wii_gx.h"
 #include "galaxy/gx_d3d12.h"
@@ -56,14 +59,7 @@ static void cp_write(uint32_t reg, uint32_t v) {
 
 static uint32_t g_pi_mask;
 static uint8_t* guest_span(uint32_t addr, size_t length) {
-    const uint32_t physical = addr & 0x3fffffffu;
-    if (addr >= 0x40000000u && addr < 0x80000000u) return nullptr;
-    const bool mem2 = physical >= 0x10000000u;
-    const uint32_t offset = mem2 ? physical - 0x10000000u : physical;
-    const size_t size = mem2 ? g_cpu.mem2_size : g_cpu.ram_size;
-    uint8_t* base = mem2 ? g_cpu.mem2 : g_cpu.ram;
-    if (!base || offset > size || length > size - offset) return nullptr;
-    return base + offset;
+    return wii::resolve(&g_cpu, addr, length);
 }
 
 static uint32_t xfb_addr() {
@@ -144,6 +140,19 @@ static bool io_page(uint32_t ea) {
            page == 0xcd800000u || page == 0x0d800000u;
 }
 
+static bool ipc_register(uint32_t ea) {
+    const uint32_t base = ea & 0x3fffffc0u;
+    return base == 0x0d000000u || base == 0x0d800000u;
+}
+
+static void ipc_irq(CPUState*) {
+    auto& ipc = ios::kernel();
+    if (ipc.reg_read(0x30) & ipc.reg_read(0x34))
+        cactus::gx_pi_raise(1u << 14);
+    else
+        cactus::gx_pi_cause_exchange(1u << 14);
+}
+
 static void vi_update(bool retrace) {
     bool irq = false;
     for (unsigned reg = 0x30; reg <= 0x3c; reg += 4) {
@@ -157,6 +166,7 @@ static void vi_update(bool retrace) {
 
 static uint64_t mmio_read(CPUState* cpu, uint32_t ea, uint8_t size) {
     if (!io_page(ea)) return 0;
+    if (ipc_register(ea)) return size == 4 ? ios::kernel().reg_read(ea) : 0;
     const uint32_t reg = ea & 0xffffu;
     if (reg >= 0x2000 && reg < 0x2080 && gx_page(ea)) {
         if (size == 4 && reg <= 0x207c)
@@ -185,6 +195,10 @@ static uint64_t mmio_read(CPUState* cpu, uint32_t ea, uint8_t size) {
 
 static void mmio_write(CPUState* cpu, uint32_t ea, uint64_t value, uint8_t size) {
     if (!io_page(ea)) return;
+    if (ipc_register(ea)) {
+        if (size == 4) ios::kernel().reg_write(ea, uint32_t(value));
+        return;
+    }
     const uint32_t reg = ea & 0xffffu;
     if (gx_page(ea) && reg >= 0x8000 && reg < 0x8020) {
         if (!size || size > 8 || reg + size > 0x8020) return;
@@ -209,7 +223,7 @@ static void mmio_write(CPUState* cpu, uint32_t ea, uint64_t value, uint8_t size)
     case 0x100a: // PE_CONTROL: acuses del token y de fin de dibujo.
         cactus::gx_pi_cause_exchange(((v & 4) ? 0x200u : 0u) | ((v & 8) ? 0x400u : 0u));
         break;
-    case 0x3000: cactus::gx_pi_cause_exchange(v); di_irq(); vi_update(false); break;
+    case 0x3000: cactus::gx_pi_cause_exchange(v); di_irq(); vi_update(false); ipc_irq(cpu); break;
     case 0x3004: g_pi_mask = v; break;
     case 0x6000: di.status = (di.status & 0x54u & ~v) | (v & 0x2au); di_irq(); break;
     case 0x6008: case 0x600c: case 0x6010: di.cmd[(reg-0x6008)/4] = v; break;
@@ -240,13 +254,24 @@ static void mmio_write32(CPUState* c, uint32_t ea, uint32_t v, uint8_t) { mmio_w
 
 int main(int argc, char** argv) {
   const char* pak_path = nullptr;
-  for (int i = 1; i < argc; ++i)
+  const char* nand_path = "nand";
+  for (int i = 1; i < argc; ++i) {
     if (!strcmp(argv[i], "--pak") && i + 1 < argc) pak_path = argv[++i];
+    else if (!strcmp(argv[i], "--nand")) {
+      if (++i == argc) { fprintf(stderr, "Falta el directorio de --nand\n"); return 2; }
+      nand_path = argv[i];
+    }
+  }
   if (!pak_path) { fprintf(stderr, "uso: %s --pak game.pak [--nand dir]\n", argv[0]); return 2; }
   if (!g_pak.open(pak_path)) { fprintf(stderr, "no se pudo abrir %s\n", pak_path); return 1; }
 
+  auto fs = ios::make_dev_fs(nand_path);
+  if (!fs) { perror(nand_path); return 1; }
   if (!cpu_init(&g_cpu)) return 1;
   if (!cpu_alloc_mem2(&g_cpu, WII_MEM2_SIZE)) return 1;   // MEM1 24 MiB + MEM2 64 MiB
+  ios::kernel().init(&g_cpu, ipc_irq);
+  ios::kernel().register_device("/dev/fs", fs);
+  ios::kernel().register_device("/dev/di", std::make_shared<ios::DevDI>(g_pak));
   g_cpu.external_read32 = [](CPUState* cpu, uint32_t ea, uint8_t) -> uint32_t {
     return uint32_t(mmio_read(cpu, ea, 4));
   };
