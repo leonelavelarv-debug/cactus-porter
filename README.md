@@ -82,15 +82,15 @@ Hecho y probado en PC:
 - **IOS**: respuestas diferidas en IPC, `/dev/di` con las órdenes que usa la biblioteca DVD, `/dev/es` (ID del título y carpeta de datos para NANDInit), `/dev/stm/eventhook` e `immediate` (apagar o volver al menú cierra el port). La NAND crea `title/00010000/<ID>/data`. Los dispositivos que falten se registran en log.txt como `[ios] sin dispositivo`.
 - **MMIO**: el FIFO del CP ya no reenvía lo que llegó por el write-gather pipe (dibujaba dos veces) ni deja la interrupción del CP levantada para siempre. PI informa el botón RESET suelto; PE guarda sus habilitaciones; DSPCR y la interrupción AID del DMA de audio.
 - **WPAD** (`dev_bt.cpp`, `wiimote.cpp`, `sysconf.cpp`): `/dev/usb/oh1/57e/305` es un adaptador Bluetooth emulado (HCI por los ioctlv de USB, L2CAP en los PSM 0x11/0x13) con un Wiimote + Nunchuk virtual (EEPROM y calibración, extensión, IR, informes 0x30-0x37 y 0x3D, vibración, LEDs). Pasados unos 2 s tras habilitar el escaneo, el Wiimote «pide conectarse». El host crea `shared2/sys/SYSCONF` con el Wiimote registrado. Mapeo: stick izq. = Nunchuk, cruz = cruz, sur = A, este/RT = B, oeste = C, LB/LT = Z, RB = agitar, norte = 1, captura = 2, Start/Back/Home = +/−/Home, stick der. = puntero IR.
-- **DSP** (`dsp_hle.cpp`): DSPCR con sus interrupciones, buzones CPU↔DSP en cola, arranque del microcódigo (ROM `0x8071FEED`, código de `__OSInitAudioSystem` `0x80544348`, subida por parejas `0x80F3…`), protocolo AX (`DSP_INIT`, `RESUME`, `YIELD` por lista de comandos, cambio de microcódigo) y DMA de ARAM real (16 MiB, con ARINT). Así DSPInit/AXInit terminan y el juego sigue. **No mezcla audio todavía**: las listas de comandos se aceptan y se descartan (silencio). `CACTUS_TRACE_DSP=1` registra todos los correos y el CRC32 del microcódigo; si la CPU espera un correo que nunca llega, avisa por stderr.
+- **DSP** (`dsp_hle.cpp`): DSPCR con sus interrupciones, buzones CPU↔DSP en cola, arranque del microcódigo (ROM `0x8071FEED`, código de `__OSInitAudioSystem` `0x80544348`, subida por parejas `0x80F3…`), protocolo AX (`DSP_INIT`, `RESUME`, `YIELD` por lista de comandos), cambio de microcódigo con los diez correos de Dolphin (y vuelta al anterior con `DSP_RESUME`) y DMA de ARAM real (16 MiB, con ARINT). El microcódigo se identifica con el hash «Ector» de Dolphin. Las listas de AX **no mezclan audio todavía** (silencio). `CACTUS_TRACE_DSP=1` registra todos los correos y el hash; si la CPU espera un correo que nunca llega, avisa por stderr.
+- **Microcódigo Zelda** (`zelda_hle.cpp`, portado de `Zelda.cpp` de Dolphin, GPL-2.0-or-later): Super Mario Galaxy 1 y 2 (`0xD643001F`), Zelda TP Wii, Pikmin NPC, DK Jungle Beat Wii y los de GameCube (Wind Waker, Sunshine, Luigi's Mansion…). Protocolo completo (órdenes 01/02/0C/0D/0E, sincronía por cada 16 voces o por cuadro, protocolo «light») y mezclador real: VPB, PCM8/PCM16/AFC de 2 y 4 bits, ondas y patrones, resampleo con la tabla del juego, filtros paso bajo y biquad, reverb, posición Dolby y volumen de salida. Escribe L/R (80 muestras por cuadro) donde lo pide el juego, que los pasa al DMA de audio. En PC, 64 voces AFC cuestan ~60 µs por cuadro (2,5 % de un núcleo).
 - **SDL**: el host usa la capa del fork (`galaxy::sdl::start` y `pump_events`), así que los mandos se abren con la base de PortMaster y se sale con MENU/SELECT + Start. Antes Start solo cerraba el juego.
 
 Pendiente, por orden de bloqueo:
 
-1. **Mezcla de AX**: el protocolo ya responde (ver DSP), pero falta recorrer las listas de comandos (PBADDR, PROCESS, OUTPUT…), decodificar las voces (PCM/ADPCM, resampleo, volúmenes) y escribir L/R en el búfer del DMA de audio. Los microcódigos que no son AX (Zelda, Mario Galaxy) usan otro protocolo y siguen sin soporte.
+1. **Mezcla de AX**: el protocolo ya responde (ver DSP), pero falta recorrer las listas de comandos (PBADDR, PROCESS, OUTPUT…), decodificar las voces (PCM/ADPCM, resampleo, volúmenes) y escribir L/R en el búfer del DMA de audio. Zelda ya mezcla, pero solo se ha probado con voces sintéticas (`tests/zelda.sh`), no con un juego.
 2. **WPAD, pruebas reales**: el adaptador Bluetooth emulado existe (ver arriba) pero solo se ha probado contra una pila HCI/L2CAP escrita aquí (`tests/wpad.sh`), no contra el SDK ni un juego. Sin verificar: orden de bytes de la MAC y el tamaño exacto de `BT.DINF` en SYSCONF, y la secuencia de conexión que espera WUD.
-3. **SYSCONF**: sin `/shared2/sys/SYSCONF` en la NAND, algunos juegos muestran un error de configuración.
-4. Módulos REL, validación del GX en la consola y pruebas en hardware.
+3. Módulos REL, validación del GX en la consola y pruebas en hardware.
 
 ### Pruebas en PC
 
@@ -102,5 +102,6 @@ dr="$PWD/fuentes/DolRecomp"; exe="$PWD/trabajo/dolrecomp-build/dolrecomp"
 ./tests/runtime.sh "$exe" "$dr"    # SPR por fallback, icbi, decrementador y vector del OS en el host
 ./tests/ios.sh "$dr"               # memoria de arranque, FST, IPC, ES, DI y eventhook diferido
 ./tests/wpad.sh                    # pila Bluetooth de prueba: HCI, L2CAP, HID, Nunchuk y SYSCONF (sin DolRecomp)
-./tests/dsp.sh                     # DSPCR, buzones, arranque de microcódigo, protocolo AX y DMA de ARAM (sin DolRecomp)
+./tests/dsp.sh                     # DSPCR, buzones, arranque de microcódigo, protocolo AX, cambio de microcódigo y DMA de ARAM
+./tests/zelda.sh                   # microcódigo Zelda (Galaxy): órdenes, sincronía, voces PCM/AFC, búferes L/R y VPB
 ```

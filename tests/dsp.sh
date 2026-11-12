@@ -6,9 +6,16 @@ host=$(cd "$(dirname "$0")/../plantilla/host" && pwd)
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 cd "$work"
-# CRC32 de la imagen de prueba (bytes 0..31), calculado fuera de C++ para no comprobarse con uno mismo.
-crc_ax=$(python3 -c 'import zlib; print(zlib.crc32(bytes(range(32))))')
-crc_new=$(python3 -c 'import zlib; print(zlib.crc32(bytes(range(64, 128))))')
+# Hash "Ector" (el de Dolphin) de las imágenes de prueba, calculado fuera de C++ para no comprobarse con uno mismo.
+ector() { python3 -c '
+import sys
+h = 0
+for b in bytes(range(int(sys.argv[1]), int(sys.argv[2]))):
+    h ^= b
+    h = ((h << 3) | (h >> 29)) & 0xFFFFFFFF
+print(h)' "$1" "$2"; }
+crc_ax=$(ector 0 32)
+crc_new=$(ector 64 128)
 cat > harness.cpp <<CPP
 #include "dsp_hle.h"
 #include <cassert>
@@ -60,7 +67,7 @@ int main() {
     clear_dspint();
     send(0x80F3D001); send(0);
     assert(dsp::current_ucode() == dsp::Ucode::Ax);
-    assert(dsp::ucode_crc() == ${crc_ax}u);
+    assert(dsp::ucode_hash() == ${crc_ax}u);
     assert((cr() & 0x80) && line);                     // DSP_INIT trae interrupción
     assert(pending() && recv() == 0xDCD10000);
     clear_dspint();
@@ -87,13 +94,21 @@ int main() {
     assert(recv() == 0xDCD10001 && !pending());
     clear_dspint();
 
-    // Cambio de microcódigo: 0xCDD10001 y siete correos (dram: dir/long/dst; iram: dir/long/dst; vector).
+    // Cambio de microcódigo: 0xCDD10001 y diez correos (MRAM<-DRAM: destino/tamaño/origen; IRAM: dirección/
+    // tamaño/destino/vector; DRAM: dirección/tamaño/destino).
     for (int i = 0; i < 64; ++i) mem[0x3000 + i] = uint8_t(64 + i);
     send(0xCDD10001);
-    const uint32_t p[7] = {0x4000, 0x100, 0, 0x3000, 64, 0, 0x10};
-    for (int i = 0; i < 7; ++i) { assert(!pending()); send(p[i]); }
-    assert(dsp::ucode_crc() == ${crc_new}u);
+    const uint32_t p[10] = {0x4000, 0, 0, 0x3000, 64, 0, 0x10, 0, 0, 0};
+    for (int i = 0; i < 10; ++i) { assert(!pending()); send(p[i]); }
+    assert(dsp::ucode_hash() == ${crc_new}u);
     assert(pending() && recv() == 0xDCD10000);
+    clear_dspint();
+    // Volver al microcódigo anterior (el mismo hash): se recupera y contesta DSP_RESUME, no DSP_INIT.
+    send(0xCDD10001);
+    const uint32_t back[10] = {0x4000, 0, 0, 0x1000, 32, 0, 0x10, 0, 0, 0};
+    for (int i = 0; i < 10; ++i) send(back[i]);
+    assert(dsp::ucode_hash() == ${crc_ax}u && dsp::current_ucode() == dsp::Ucode::Ax);
+    assert(line && recv() == 0xDCD10001 && !pending());
     clear_dspint();
 
     // 0xCDD10002 devuelve el DSP a su ROM.
@@ -137,5 +152,5 @@ int main() {
     return 0;
 }
 CPP
-g++ -std=c++17 -Wall -Wextra -Werror -I"$host" harness.cpp "$host/dsp_hle.cpp" -o harness
+g++ -std=c++20 -Wall -Wextra -Werror -I"$host" harness.cpp "$host/dsp_hle.cpp" "$host/zelda_hle.cpp" -o harness
 ./harness

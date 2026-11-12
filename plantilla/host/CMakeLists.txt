@@ -67,7 +67,7 @@ target_include_directories(cactus_game_cpu PRIVATE "${GENERATED_DIR}" "${DOLRECO
 target_compile_options(cactus_game_cpu PRIVATE -O2 -Wall)
 
 add_executable(${CACTUS_SLUG}-host
-    wii_host.cpp wii_boot.cpp dsp_hle.cpp wiimote.cpp dev_bt.cpp sysconf.cpp ios.cpp dev_di.cpp dev_fs.cpp dev_misc.cpp wii_dvd.cpp gx_bridge.cpp juego_glue.cpp
+    wii_host.cpp wii_boot.cpp dsp_hle.cpp zelda_hle.cpp wiimote.cpp dev_bt.cpp sysconf.cpp ios.cpp dev_di.cpp dev_fs.cpp dev_misc.cpp wii_dvd.cpp gx_bridge.cpp juego_glue.cpp
     "${CACTUS_GALAXY_ROOT}/platform/knulli/game/host_window_knulli.cpp"
     "${CACTUS_GALAXY_ROOT}/platform/sdl/display_clock.cpp"
     $<TARGET_OBJECTS:cactus_game_cpu>)

@@ -6,19 +6,25 @@
 //    __OSInitAudioSystem desde ARAM: manda 0x80544348.
 //  * ROM: el SDK sube el microcódigo con parejas "etiqueta, dato" (0x80F3A001 dirección, 0x80F3C002 destino,
 //    0x80F3A002 longitud, 0x80F3B002 DRAM, 0x80F3D001 vector de inicio). Con la última arranca el microcódigo.
+//  * El microcódigo se identifica como Dolphin, con el hash "Ector" de su imagen de IRAM. La familia Zelda
+//    (Mario Galaxy 1/2, Zelda TP, Pikmin NPC...) va a zelda_hle.cpp; el resto se trata como AX.
 //  * AX: el microcódigo contesta DSP_INIT (0xDCD10000) al arrancar, DSP_RESUME (0xDCD10001) a 0xCDD10000 y
 //    DSP_YIELD (0xDCD10002) al terminar una lista de comandos (0xBABE0000|tamaño, y luego su dirección).
-//    0xCDD10001 anuncia un cambio de microcódigo (siete correos de parámetros).
+//  * 0xCDD10001 anuncia un cambio de microcódigo: diez correos (MRAM<-DRAM: destino, tamaño, origen;
+//    IRAM: dirección, tamaño, destino, vector; DRAM: dirección, tamaño, destino). El microcódigo anterior se
+//    guarda; si luego se vuelve a subir el mismo, se recupera y contesta DSP_RESUME (como SwapUCode de Dolphin).
 //  * Los buzones son de un solo correo: el DSP no manda el siguiente hasta que la CPU lee el bajo (0x5006).
 //    Aquí se encolan. Los correos con interrupción levantan DSPINT cuando llegan al frente.
 //
-// Todos los microcódigos se tratan como AX. Si uno usa otro protocolo (p. ej. el de Zelda/Mario Galaxy) los
-// correos desconocidos se registran con CACTUS_TRACE_DSP=1 y el juego se quedará esperando.
+// Microcódigos con otros protocolos (tarjeta, GBA, ASnd...) se tratan como AX: con CACTUS_TRACE_DSP=1 se ven
+// sus correos y su hash.
 #include "dsp_hle.h"
+#include "zelda_hle.h"
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <deque>
+#include <memory>
 #include <vector>
 
 namespace dsp {
@@ -52,10 +58,15 @@ struct State {
     // AX
     bool want_list = false;
     uint32_t list_size = 0;
+    uint32_t frames = 0;
+    // Zelda
+    std::unique_ptr<zelda::Ucode> zelda;
+    // Cambio de microcódigo (0xCDD10001 y diez correos) y el microcódigo guardado para volver a él.
     bool uploading = false;
-    uint32_t upload[7] = {};
+    uint32_t upload[10] = {};
     unsigned upload_n = 0;
-    uint32_t crc = 0, frames = 0;
+    uint32_t hash = 0;
+    struct Saved { bool valid = false; Ucode kind = Ucode::None; uint32_t hash = 0; std::unique_ptr<zelda::Ucode> zelda; } saved;
     // ARAM
     uint32_t ar_mm = 0, ar_ar = 0, ar_cnt = 0;
     std::vector<uint8_t> aram;
@@ -63,13 +74,14 @@ struct State {
 
 #define TRACE(...) do { if (s.trace) { std::fprintf(stderr, "[dsp] " __VA_ARGS__); std::fputc('\n', stderr); } } while (0)
 
-uint32_t crc32(const uint8_t* p, size_t n) {
-    uint32_t c = 0xFFFFFFFFu;
+// Hash "Ector" de Dolphin (Common::HashEctor): con él están catalogados los microcódigos.
+uint32_t ector_hash(const uint8_t* p, size_t n) {
+    uint32_t h = 0;
     for (size_t i = 0; i < n; ++i) {
-        c ^= p[i];
-        for (int k = 0; k < 8; ++k) c = (c >> 1) ^ (0xEDB88320u & (0u - (c & 1u)));
+        h ^= p[i];
+        h = (h << 3) | (h >> 29);
     }
-    return ~c;
+    return h;
 }
 
 void update_irq() {
@@ -102,6 +114,7 @@ void flush_mail() {
 void start_rom() {
     TRACE("reinicio: ROM");
     s.ucode = Ucode::Rom;
+    s.zelda.reset();
     s.rom_tag = s.rom_ram = s.rom_len = 0;
     s.want_list = s.uploading = false;
     flush_mail();
@@ -115,23 +128,80 @@ void start_init_audio() {
     push(INITAUDIO_READY, false);
 }
 
-void start_ax(uint32_t image, uint32_t length) {
-    s.crc = 0;
-    if (length && length <= 0x10000)
-        if (const uint8_t* p = s.host.span ? s.host.span(image, length) : nullptr) s.crc = crc32(p, length);
-    TRACE("microcódigo en %08X, %u bytes, CRC32 %08X: se trata como AX", image, length, s.crc);
-    s.ucode = Ucode::Ax;
+// Lo que el microcódigo Zelda necesita del DSP.
+uint8_t* zelda_span(uint32_t addr, size_t len) { return s.host.span ? s.host.span(addr, len) : nullptr; }
+void zelda_written(uint32_t addr, size_t len) {
+    if (s.host.mem_written) s.host.mem_written(addr | 0x80000000u, len);
+}
+uint8_t* zelda_aram(uint32_t off, size_t len) {
+    if (s.aram.empty()) s.aram.assign(ARAM_SIZE, 0);
+    return (off < ARAM_SIZE && len <= ARAM_SIZE - off) ? s.aram.data() + off : nullptr;
+}
+void zelda_push(uint32_t mail, bool irq) { push(mail, irq); }
+void zelda_dspint() { s.cr |= CR_DSPINT; update_irq(); }
+const zelda::Env kZeldaEnv{zelda_span, zelda_written, zelda_aram, zelda_push, zelda_dspint};
+
+uint32_t image_hash(uint32_t image, uint32_t length) {
+    if (!length || length > 0x10000 || !s.host.span) return 0;
+    const uint8_t* p = s.host.span(image, length);
+    return p ? ector_hash(p, length) : 0;
+}
+
+// Arranca un microcódigo nuevo (Initialize de Dolphin): Zelda si el hash es de su familia, si no AX.
+void boot_fresh(uint32_t hash) {
+    s.hash = hash;
     s.want_list = s.uploading = false;
+    s.zelda.reset();
     flush_mail();
-    push(DSP_INIT, true);
+    if (zelda::known(hash)) {
+        TRACE("microcódigo %08X: Zelda", hash);
+        s.ucode = Ucode::Zelda;
+        s.zelda = std::make_unique<zelda::Ucode>(kZeldaEnv, hash);
+        s.zelda->initialize();
+    } else {
+        TRACE("microcódigo %08X: se trata como AX", hash);
+        s.ucode = Ucode::Ax;
+        push(DSP_INIT, true);
+    }
+}
+
+// Desde la ROM (SetUCode): sin guardar nada.
+void boot_from_rom(uint32_t image, uint32_t length) {
+    TRACE("ROM: microcódigo en %08X, %u bytes", image, length);
+    boot_fresh(image_hash(image, length));
+}
+
+// Desde un microcódigo en marcha (SwapUCode): se guarda el actual o se recupera el guardado.
+void swap_ucode() {
+    const uint32_t image = s.upload[3], length = s.upload[4] & 0xFFFF;
+    const uint32_t hash = image_hash(image, length);
+    TRACE("cambio de microcódigo: IRAM en %08X, %u bytes, hash %08X", image, length, hash);
+    s.uploading = false;
+    if (s.saved.valid && s.saved.hash == hash) {
+        flush_mail();
+        s.ucode = s.saved.kind;
+        s.hash = hash;
+        s.zelda = std::move(s.saved.zelda);
+        s.saved = {};
+        s.want_list = false;
+        push(DSP_RESUME, true);  // el microcódigo recuperado sigue donde lo dejó
+        return;
+    }
+    if (!s.saved.valid) {
+        s.saved.valid = true;
+        s.saved.kind = s.ucode;
+        s.saved.hash = s.hash;
+        s.saved.zelda = std::move(s.zelda);
+    }
+    boot_fresh(hash);
 }
 
 void rom_mail(uint32_t m) {
     if (s.rom_tag) {
         switch (s.rom_tag & 0xFFFF) {
         case 0xA001: s.rom_ram = m; break;
-        case 0xA002: s.rom_len = m; break;
-        case 0xD001: s.rom_tag = 0; start_ax(s.rom_ram, s.rom_len); return;
+        case 0xA002: s.rom_len = m & 0xFFFF; break;
+        case 0xD001: s.rom_tag = 0; boot_from_rom(s.rom_ram, s.rom_len); return;
         default: break;  // C002 (destino en IRAM) y B002 (DRAM): no hacen falta
         }
         s.rom_tag = 0;
@@ -139,6 +209,7 @@ void rom_mail(uint32_t m) {
     }
     if ((m & 0xFFFF0000u) == 0x80F30000u) { s.rom_tag = m; return; }
     TRACE("ROM: correo inesperado %08X", m);
+    push(0xFEEE0000u | (m & 0xFFFF), false);
 }
 
 // ---------------------------------------------------------------- AX
@@ -153,15 +224,9 @@ void ax_list(uint32_t addr, uint32_t size) {
     }
 }
 
+void begin_upload() { s.uploading = true; s.upload_n = 0; }
+
 void ax_mail(uint32_t m) {
-    if (s.uploading) {
-        s.upload[s.upload_n++] = m;
-        if (s.upload_n == 7) {  // dram addr/len/dst, iram addr/len/dst, vector de inicio
-            s.uploading = false;
-            start_ax(s.upload[3], s.upload[4]);
-        }
-        return;
-    }
     if (s.want_list) {
         s.want_list = false;
         ax_list(m, s.list_size);
@@ -169,18 +234,32 @@ void ax_mail(uint32_t m) {
         return;
     }
     if (m == MAIL_RESUME) { push(DSP_RESUME, true); return; }
-    if (m == MAIL_NEW_UCODE) { s.uploading = true; s.upload_n = 0; return; }
+    if (m == MAIL_NEW_UCODE) { begin_upload(); return; }
     if (m == MAIL_RESET) { start_rom(); return; }
     if (m == MAIL_CONTINUE) return;
     if ((m & MAIL_CMDLIST_MASK) == MAIL_CMDLIST) { s.want_list = true; s.list_size = m & 0xFFFF; return; }
     TRACE("AX: correo desconocido %08X", m);
 }
 
+void zelda_mail(uint32_t m) {
+    switch (s.zelda->handle_mail(m)) {
+    case zelda::Action::UploadNewUcode: begin_upload(); break;
+    case zelda::Action::ResetToRom: start_rom(); break;
+    case zelda::Action::None: break;
+    }
+}
+
 void cpu_mail(uint32_t m) {
     TRACE("CPU -> DSP %08X", m);
+    if (s.uploading && s.ucode != Ucode::Rom) {  // PrepareBootUCode: va antes que el protocolo del microcódigo
+        s.upload[s.upload_n++] = m;
+        if (s.upload_n == 10) swap_ucode();
+        return;
+    }
     switch (s.ucode) {
     case Ucode::Rom: rom_mail(m); break;
     case Ucode::Ax: ax_mail(m); break;
+    case Ucode::Zelda: if (s.zelda) zelda_mail(m); break;
     default: TRACE("correo ignorado (sin microcódigo)"); break;
     }
 }
@@ -287,7 +366,7 @@ void raise_status(uint16_t bits) {
 }
 
 Ucode current_ucode() { return s.ucode; }
-uint32_t ucode_crc() { return s.crc; }
-uint32_t frames_processed() { return s.frames; }
+uint32_t ucode_hash() { return s.hash; }
+uint32_t frames_processed() { return s.frames + (s.zelda ? s.zelda->frames_rendered() : 0); }
 
 }  // namespace dsp

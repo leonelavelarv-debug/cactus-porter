@@ -2,8 +2,8 @@
 // protocolo de AX (listas de comandos) y DMA de ARAM. No depende de SDL: se prueba en PC.
 //
 // Alcance: el DSP "contesta" al instante y con el protocolo correcto, así que el SDK (DSPInit/AXInit) termina
-// su arranque y el juego sigue. AX NO mezcla todavía: las listas de comandos se aceptan y se descartan, y el
-// audio sale en silencio. Mezclar voces (PB, ADPCM, resampleo) es el siguiente paso, ver dsp_hle.cpp::ax_list().
+// su arranque y el juego sigue. El microcódigo Zelda (Mario Galaxy 1/2, Zelda TP...) sí mezcla audio
+// (zelda_hle.cpp, portado de Dolphin). AX NO mezcla todavía: sus listas de comandos se aceptan y se descartan.
 #pragma once
 #include <cstddef>
 #include <cstdint>
@@ -16,7 +16,7 @@ struct Host {
     void (*mem_written)(uint32_t addr, size_t len);  // opcional: el DSP escribió en memoria principal
 };
 
-enum class Ucode { None, Rom, InitAudio, Ax };
+enum class Ucode { None, Rom, InitAudio, Ax, Zelda };
 
 void init(const Host& host);   // engancha el host y deja el DSP como al encender
 void refresh_irq();            // vuelve a evaluar la línea de interrupción (p. ej. tras escribir PI_CAUSE)
@@ -31,7 +31,7 @@ void write(uint32_t reg, uint16_t value);
 void raise_status(uint16_t bits);
 
 Ucode current_ucode();
-uint32_t ucode_crc();          // CRC32 de la última imagen de microcódigo subida (0 si ninguna)
-uint32_t frames_processed();   // listas de comandos AX aceptadas
+uint32_t ucode_hash();         // hash "Ector" (el de Dolphin) del microcódigo en marcha (0 si ninguno)
+uint32_t frames_processed();   // listas de comandos AX aceptadas + cuadros que mezcló Zelda
 
 }  // namespace dsp
