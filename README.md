@@ -74,4 +74,14 @@ El resultado esperado de `file` es un ELF de 64 bits para AArch64. El arranque s
 
 ## Estado de esta entrega
 
-El host cuenta con su CMakeLists.txt y el puente GX. El comando build configura el host con las fuentes C generadas para el juego y el checkout de cactus-galaxy. Falta conectar el despacho de CPU en juego_glue.cpp y validar la compilación ARM64 con el fork y la ejecución en la consola.
+El host cuenta con su CMakeLists.txt y el puente GX. El comando build configura el host con las fuentes C generadas para el juego y el checkout de cactus-galaxy. El backend C despacha bloques con un presupuesto por retrace. El PI entrega interrupciones externas al vector 0x500 si la máscara y MSR[EE] lo permiten. El vector debe tener código recompilado accesible. El modelo VI agrupa las interrupciones de pantalla por retrace. DI cubre lecturas directas 0xA8 del espacio descifrado y audio cubre DMA PCM. Los servicios IOS/DVD, DSP/AX y WPAD que necesite cada juego, los módulos dinámicos y las pruebas en hardware siguen pendientes.
+
+### Prueba del despacho en PC
+
+Con DolRecomp compilado en el PC y sus fuentes disponibles:
+
+```bash
+./tests/dispatch.sh "$PWD/trabajo/dolrecomp-build/dolrecomp" "$PWD/fuentes/DolRecomp"
+```
+
+Genera un DOL mínimo en un directorio temporal y comprueba el contador del juego, las máscaras de interrupción, la entrada al vector externo y el retorno al código interrumpido.

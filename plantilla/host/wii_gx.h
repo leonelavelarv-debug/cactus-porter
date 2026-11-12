@@ -15,6 +15,6 @@ void     gx_pi_raise(uint32_t bits);
 uint16_t gx_pe_token_value();
 bool     gx_quit_requested();
 // Ejecución del C generado (sigue siendo por juego, ver juego_glue.cpp):
-void     game_init(CPUState* cpu, uint32_t entry);
-void     game_frame(CPUState* cpu);
+bool     game_init(CPUState* cpu, uint32_t entry);
+bool     game_frame(CPUState* cpu, const uint32_t& pi_mask);
 }

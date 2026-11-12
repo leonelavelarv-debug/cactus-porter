@@ -36,33 +36,45 @@ def dolr():  return FUENTES / "DolRecomp"
 # ---------------------------------------------------------------- doctor
 def cmd_doctor(_):
     ok = True
-    for tool in ("git", "cmake", "g++", "python3"):
+    for tool in ("git", "cmake", "g++", "python3", "clang", "clang++", "ld.lld"):
         tiene = shutil.which(tool) is not None
         print(f"  [{'x' if tiene else ' '}] {tool}")
         ok &= tiene
-    for tool in ("clang", "ld.lld", "ninja"):
-        print(f"  [{'x' if shutil.which(tool) else ' '}] {tool} (cross-compile; ninja opcional)")
     probe = "#include <zlib.h>\n#include <bzlib.h>\n#include <lzma.h>\n#include <zstd.h>\nint main(){return 0;}\n"
     t = TRABAJO / "doctor"; t.mkdir(parents=True, exist_ok=True)
     (t / "h.c").write_text(probe)
     p = subprocess.run(["g++", "-x", "c++", str(t/"h.c"), "-o", str(t/"h"),
-                        "-lz", "-lbz2", "-llzma", "-lzstd"], capture_output=True)
-    print(f"  [{'x' if p.returncode==0 else ' '}] zlib/bzip2/lzma/zstd de desarrollo (sonda del PC)")
-    if p.returncode: print("      Ubuntu/Debian: sudo apt install zlib1g-dev libbz2-dev liblzma-dev libzstd-dev")
+                        "-lz", "-lbz2", "-llzma", "-lzstd"], capture_output=True) if shutil.which("g++") else None
+    ok &= bool(p and p.returncode == 0)
+    print(f"  [{'x' if p and p.returncode==0 else ' '}] zlib/bzip2/lzma/zstd de desarrollo (sonda del PC)")
+    if not p or p.returncode: print("      Ubuntu/Debian: sudo apt install zlib1g-dev libbz2-dev liblzma-dev libzstd-dev")
     xt = os.environ.get("AARCH64_XTOOLS", "")
-    print(f"  [{'x' if xt and Path(xt).exists() else ' '}] AARCH64_XTOOLS (crosstool-NG aarch64-rpi3-linux-gnu, glibc<=2.27)")
+    xt_ok = bool(xt and (Path(xt) / "aarch64-rpi3-linux-gnu/sysroot").is_dir())
+    ok &= xt_ok
+    print(f"  [{'x' if xt_ok else ' '}] AARCH64_XTOOLS (crosstool-NG aarch64-rpi3-linux-gnu, glibc<=2.27)")
     sdl = os.environ.get("CACTUS_SDL2_PREFIX", "")
-    print(f"  [{'x' if sdl and Path(sdl).exists() else ' '}] CACTUS_SDL2_PREFIX (SDL2 compilado para aarch64)")
+    sdl_ok = bool(sdl and (Path(sdl) / "include/SDL2/SDL.h").is_file() and
+                  (Path(sdl) / "lib/libSDL2-2.0.so").is_file())
+    ok &= sdl_ok
+    print(f"  [{'x' if sdl_ok else ' '}] CACTUS_SDL2_PREFIX (SDL2 compilado para aarch64)")
     print("\nGuía: el toolchain y el SDL2 de aarch64 se preparan como en docs/RG35XXH.md de tu fork.")
     print("El perfil del juego sale de tu propio disco (probe); el .pak final lo hace la consola.")
+
+    if not ok:
+        raise SystemExit(1)
 
 # ---------------------------------------------------------------- fetch
 def cmd_fetch(_):
     FUENTES.mkdir(exist_ok=True)
     for nombre, url in REPOS.items():
         dst = FUENTES / nombre
-        if dst.exists(): print(f"= {nombre} ya está"); continue
-        run(["git", "clone", "--depth", "1", url, dst])
+        branch = ["--branch", "rg35xxh-arm64"] if nombre == "cactus-galaxy" else []
+        if not dst.exists():
+            run(["git", "clone", "--depth", "1", *branch, url, dst])
+        if nombre == "DolRecomp":
+            run(["git", "submodule", "update", "--init", "--recursive"], cwd=dst)
+        elif run(["git", "branch", "--show-current"], cwd=dst, capture=True).stdout.strip() != "rg35xxh-arm64":
+            sys.exit(f"!! Cambia {dst} a la rama rg35xxh-arm64 antes de compilar.")
 
 # ------------------------------------------------- parche de nebula-pak
 TMD_NEW = '''void validate_tmd(const std::vector<u8>& tmd) {  // cactus-porter: cualquier juego Wii
@@ -117,7 +129,7 @@ def cmd_probe(args):
     if not iso.exists(): sys.exit(f"!! no existe {iso}")
     t = TRABAJO / "sonda"; t.mkdir(parents=True, exist_ok=True)
     modos = (PLANTILLA / "parche" / "modos.cpp").read_text()
-    src = parchear_nebula_pak((fork()/"platform/knulli/pak/nebula_pak.cpp").read_text(),
+    src = parchear_nebula_pak(fuente_original(fork()/"platform/knulli/pak/nebula_pak.cpp"),
                               {"id": "WII000", "nombre": "juego Wii", "part_bytes": 0}, modos)
     cpp = t / "cactus_pak_sonda.cpp"; cpp.write_text(src)
     exe = t / "cactus-pak-sonda"
@@ -133,6 +145,7 @@ def cmd_probe(args):
     (dj / "perfil.json").write_text(json.dumps(perfil, indent=2, ensure_ascii=False))
     print(f"\nPerfil de {nombre} ({gid}): SHA-1 {sha[:12]}…, partición {int(pb)>>20} MiB")
     print(f"Guardado en {dj/'perfil.json'}; main.dol listo para DolRecomp.")
+    return gid
 
 # ---------------------------------------------------------------- recomp
 def cmd_recomp(args):
@@ -140,33 +153,39 @@ def cmd_recomp(args):
     dj = dir_juego(args.juego)
     b = TRABAJO / "dolrecomp-build"
     run(["cmake", "-S", dolr(), "-B", b, "-DCMAKE_BUILD_TYPE=Release"])
-    run(["cmake", "--build", b, "--config", "Release", "-j", str(os.cpu_count() or 4)])
+    run(["cmake", "--build", b, "--target", "dolrecomp", "--config", "Release", "-j", str(os.cpu_count() or 4)])
     exe = b / "dolrecomp"
-    cmd = [exe]
+    cmd = [exe, "--cpu", "broadway"]
     if args.map:    cmd += ["--map", args.map]
     if args.config: cmd += ["--config", args.config]
-    cmd += [dj / "main.dol", perfil["id"], dj / "recomp"]
-    run(cmd)
-    gen = dj / "recomp" / f"{perfil['id']}_generated"
-    if not gen.exists(): sys.exit(f"!! DolRecomp no generó {gen}")
-    print(f"\nC generado en {gen} ({len(list(gen.glob('*.c')))} fuentes)")
+    gid = perfil["id"]
+    gen = dj / "recomp" / f"{gid}_generated"
+    gen.mkdir(parents=True, exist_ok=True)
+    run(cmd + [dj / "main.dol", gid, gen / f"{gid}.c"])
+    print(f"C generado en {gen}")
 
 # ---------------------------------------------------------------- build
-def parchear_fork_en_sitio(perfil):
-    """Parchea nebula_pak.cpp (y el branding del wrapper) dentro del checkout del fork,
-    guardando copia .cactus-orig. El CMake del pak usa third_party por ruta relativa,
-    así que se compila en su propio sitio."""
-    modos = (PLANTILLA / "parche" / "modos.cpp").read_text()
-    pak = fork()/"platform/knulli/pak/nebula_pak.cpp"
-    if not pak.with_suffix(".cpp.cactus-orig").exists():
-        shutil.copy2(pak, pak.with_suffix(".cpp.cactus-orig"))
-    original = pak.with_suffix(".cpp.cactus-orig").read_text()
-    pak.write_text(parchear_nebula_pak(original, perfil, modos))
-    wr = fork()/"platform/knulli/cactus/cactus_wrapper.cpp"
-    if not wr.with_suffix(".cpp.cactus-orig").exists():
-        shutil.copy2(wr, wr.with_suffix(".cpp.cactus-orig"))
-    wr.write_text(wr.with_suffix(".cpp.cactus-orig").read_text()
-                  .replace("Super Mario Galaxy", perfil["nombre"]))
+def fuente_original(path):
+    backup = path.with_suffix(path.suffix + ".cactus-orig")
+    return (backup if backup.exists() else path).read_text()
+
+def preparar_pak(perfil, dj):
+    # El CMake del fork resuelve third_party tres niveles por encima del proyecto.
+    root = dj / "fuentes-pak"
+    root.mkdir(parents=True, exist_ok=True)
+    deps = root / "third_party"
+    if not deps.is_symlink():
+        deps.symlink_to(fork() / "third_party", target_is_directory=True)
+    for subdir in ("pak", "cactus"):
+        src = fork() / "platform/knulli" / subdir
+        shutil.copytree(src, root / "platform/knulli" / subdir, dirs_exist_ok=True,
+                        ignore=shutil.ignore_patterns("*.cactus-orig"))
+    pak = Path("platform/knulli/pak/nebula_pak.cpp")
+    modos = (PLANTILLA / "parche/modos.cpp").read_text()
+    (root / pak).write_text(parchear_nebula_pak(fuente_original(fork()/pak), perfil, modos))
+    wrapper = Path("platform/knulli/cactus/cactus_wrapper.cpp")
+    (root / wrapper).write_text(fuente_original(fork()/wrapper).replace("Super Mario Galaxy", perfil["nombre"]))
+    return (root / pak).parent
 
 def cmd_restore(_):
     for p in fork().rglob("*.cactus-orig"):
@@ -189,10 +208,10 @@ def cmd_build(args):
     toolchain = fork()/"platform/knulli/aarch64-toolchain.cmake"
     sdl = env["CACTUS_SDL2_PREFIX"]
     gen = ["-G", "Ninja"] if shutil.which("ninja") else []
-    parchear_fork_en_sitio(perfil)
+    pak_src = preparar_pak(perfil, dj)
     # 1) convertidor del juego + wrapper (CMake del propio fork, third_party vendored)
-    bp = dj / "build-pak"
-    run(["cmake", "-S", fork()/"platform/knulli/pak", "-B", bp, *gen,
+    bp = dj / "build-pak-perfil"
+    run(["cmake", "-S", pak_src, "-B", bp, *gen,
          "-DCMAKE_BUILD_TYPE=Release", f"-DCMAKE_TOOLCHAIN_FILE={toolchain}",
          f"-DCACTUS_SDL2_PREFIX={sdl}"], env=env)
     run(["cmake", "--build", bp], env=env)
@@ -216,8 +235,8 @@ def cmd_package(args):
     shutil.rmtree(puerto, ignore_errors=True)
     gd.mkdir(parents=True)
     (gd / "gamedata").mkdir(); (gd / "nand").mkdir()
-    for binario, src in [("nebula-pak", dj/"build-pak/nebula-pak"),
-                         ("cactus-galaxy-wrapper", dj/"build-pak/cactus-galaxy-wrapper"),
+    for binario, src in [("nebula-pak", dj/"build-pak-perfil/nebula-pak"),
+                         ("cactus-galaxy-wrapper", dj/"build-pak-perfil/cactus-galaxy-wrapper"),
                          (f"{slug}-host", dj/f"build-host/{slug}-host")]:
         if not src.exists(): sys.exit(f"!! falta {src}; ejecuta antes: build --juego {gid}")
         shutil.copy2(src, gd / binario); (gd / binario).chmod(0o755)
@@ -247,13 +266,7 @@ def cmd_package(args):
     print(f"\nPort listo: {zip_path}\nInstálalo con PortMaster (KNULLI/muOS) y pon tu disco en ports/{slug}/gamedata/.")
 
 def cmd_all(args):
-    cmd_probe(args); 
-    class A: pass
-    a = A(); a.juego = json.loads((TRABAJO/"sonda"/"..").joinpath("").resolve().as_posix() and "") if False else None
-    # el id sale del perfil recién creado
-    perfiles = sorted(TRABAJO.glob("*/perfil.json"), key=lambda p: p.stat().st_mtime)
-    gid = json.loads(perfiles[-1].read_text())["id"]
-    a.juego = gid; a.map = args.map; a.config = args.config
+    a = argparse.Namespace(juego=cmd_probe(args), map=args.map, config=args.config)
     cmd_recomp(a); cmd_build(a); cmd_package(a)
 
 def main():

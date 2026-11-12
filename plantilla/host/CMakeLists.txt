@@ -40,10 +40,23 @@ endif()
 message(STATUS "cactus-porter: librería GX del fork = ${CACTUS_GX_LIB}")
 
 # ---------------- fuentes del port ----------------
-file(GLOB GEN_SOURCES CONFIGURE_DEPENDS "${GENERATED_DIR}/*.c")
-if(NOT GEN_SOURCES)
-    message(FATAL_ERROR "Sin código generado en ${GENERATED_DIR} (ejecuta 'recomp' antes)")
+get_filename_component(game_dir "${GENERATED_DIR}" NAME)
+string(REGEX REPLACE "_generated$" "" game_id "${game_dir}")
+set(manifest "${GENERATED_DIR}/${game_id}.c")
+if(NOT EXISTS "${manifest}" OR NOT EXISTS "${GENERATED_DIR}/${game_id}.h")
+    message(FATAL_ERROR "Falta el C generado para ${game_id}. Ejecuta recomp.")
 endif()
+# El manifiesto identifica los chunks vigentes, incluso después de regenerar.
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${manifest}")
+file(STRINGS "${manifest}" chunks REGEX "^// [a-zA-Z0-9_]+/[^ ]+\\.c$")
+if(NOT chunks)
+    message(FATAL_ERROR "El manifiesto no contiene chunks de DolRecomp")
+endif()
+set(GEN_SOURCES "${manifest}")
+foreach(chunk IN LISTS chunks)
+    string(SUBSTRING "${chunk}" 3 -1 chunk_path)
+    list(APPEND GEN_SOURCES "${GENERATED_DIR}/${chunk_path}")
+endforeach()
 
 # El renderer exporta una cabecera de compatibilidad de C++ por -include.
 # Las unidades C de DolRecomp se compilan con sus propias opciones.
@@ -59,6 +72,7 @@ add_executable(${CACTUS_SLUG}-host
     "${CACTUS_GALAXY_ROOT}/platform/sdl/display_clock.cpp"
     $<TARGET_OBJECTS:cactus_game_cpu>)
 
+target_compile_definitions(${CACTUS_SLUG}-host PRIVATE CACTUS_GENERATED_HEADER="${game_id}.h")
 target_include_directories(${CACTUS_SLUG}-host PRIVATE
     "${GENERATED_DIR}"
     "${DOLRECOMP_DIR}/src"

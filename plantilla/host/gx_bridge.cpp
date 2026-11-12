@@ -31,11 +31,11 @@ void servicio_fatal(void*, uint32_t pc, const char* msg) {
 }
 // El renderer los llama desde el hilo de render: solo atómicos.
 void pe_finish(void*) {
-    g_pi_cause.fetch_or(0x4000u, std::memory_order_release);   // INT_CAUSE_PE_FINISH
+    g_pi_cause.fetch_or(0x400u, std::memory_order_release);   // INT_CAUSE_PE_FINISH
 }
 void pe_token(void*, uint16_t token, bool interrupt) {
     g_pe_token.store(token, std::memory_order_release);
-    if (interrupt) g_pi_cause.fetch_or(0x2000u, std::memory_order_release);  // INT_CAUSE_PE_TOKEN
+    if (interrupt) g_pi_cause.fetch_or(0x200u, std::memory_order_release);  // INT_CAUSE_PE_TOKEN
 }
 }  // namespace
 
