@@ -15,6 +15,9 @@
 #include "dsp_hle.h"
 #include "guest_memory.h"
 #include "sdl_host.h"
+#include "dev_bt.h"
+#include "sysconf.h"
+#include "galaxy/input_bindings.h"
 #include "wii_boot.h"
 #include "wii_dvd.h"
 #include "wii_gx.h"
@@ -293,6 +296,47 @@ static bool make_dirs(const std::string& path) {
     return true;
 }
 
+
+// Mando del handheld -> Wiimote + Nunchuk. Stick izquierdo = Nunchuk, cruz = cruz, sur = A, este = B (también RT),
+// oeste = C, LB/LT = Z, RB = agitar, norte = 1, captura = 2. El stick derecho mueve el puntero IR (acumulado).
+static wpad::Input read_pad(std::shared_ptr<ios::DevBt>& bt, float dt) {
+  using namespace galaxy::input;
+  static float px = 0, py = 0;
+  static bool pointer_on = false;
+  wpad::Input in;
+  const auto st = galaxy::sdl::input_state();
+  const PadSample* pad = nullptr;
+  for (const PadSample& p : st.pads) if (p.connected) { pad = &p; break; }
+  if (!pad) return in;
+  auto down = [&](unsigned bit) { return (pad->buttons & pad::bit(bit)) != 0; };
+  auto axis = [&](PadAxis a) { return pad->axes[size_t(a)]; };
+  if (down(pad::kDpadLeftBit)) in.buttons |= wpad::Left;
+  if (down(pad::kDpadRightBit)) in.buttons |= wpad::Right;
+  if (down(pad::kDpadUpBit)) in.buttons |= wpad::Up;
+  if (down(pad::kDpadDownBit)) in.buttons |= wpad::Down;
+  if (down(pad::kStartBit)) in.buttons |= wpad::Plus;
+  if (down(pad::kBackBit)) in.buttons |= wpad::Minus;
+  if (down(pad::kHomeBit)) in.buttons |= wpad::Home;
+  if (down(pad::kSouthBit)) in.buttons |= wpad::A;
+  if (down(pad::kEastBit) || axis(PadAxis::RightTrigger) > 0.5f) in.buttons |= wpad::B;
+  if (down(pad::kNorthBit)) in.buttons |= wpad::One;
+  if (down(pad::kCaptureBit)) in.buttons |= wpad::Two;
+  in.c = down(pad::kWestBit);
+  in.z = down(pad::kLeftShoulderBit) || axis(PadAxis::LeftTrigger) > 0.5f;
+  in.shake = down(pad::kRightShoulderBit);
+  in.stick_x = axis(PadAxis::LeftX);
+  in.stick_y = axis(PadAxis::LeftY);
+  const float rx = axis(PadAxis::RightX), ry = -axis(PadAxis::RightY);  // y del puntero: abajo positivo
+  if (rx != 0 || ry != 0) pointer_on = true;
+  px = std::fmax(-1.f, std::fmin(1.f, px + rx * 1.6f * dt));
+  py = std::fmax(-1.f, std::fmin(1.f, py + ry * 1.6f * dt));
+  in.pointer = pointer_on;
+  in.pointer_x = px;
+  in.pointer_y = py;
+  (void)bt;
+  return in;
+}
+
 int main(int argc, char** argv) {
   const char* pak_path = nullptr;
   const char* nand_path = "nand";
@@ -352,6 +396,9 @@ int main(int argc, char** argv) {
   ios::kernel().register_device("/dev/fs", fs);
   ios::kernel().register_device("/dev/di", std::make_shared<ios::DevDI>(g_pak));
   ios::register_misc_devices(ios::kernel(), boot.title_id);
+  if (!wiisys::ensure(nand_path)) std::fprintf(stderr, "Aviso: no se pudo escribir SYSCONF en la NAND\n");
+  auto bt = ios::make_bt_device();
+  ios::kernel().register_device("/dev/usb/oh1/57e/305", bt);
   dsp::init({guest_span, dsp_irq_line, dsp_mem_written});
 
   // La capa SDL del fork: ventana, mandos (base de PortMaster), combinación de salida y audio.
@@ -380,6 +427,12 @@ int main(int argc, char** argv) {
     // Eventos y mandos los atiende la capa del fork; MENU/SELECT + Start pide salir.
     galaxy::sdl::pump_events(0);
     if (cactus::gx_quit_requested() || ios::kernel().shutdown_requested()) break;
+    bt->tick(read_pad(bt, float(period)));
+    {
+      const auto pads = galaxy::sdl::input_state();
+      for (size_t i = 0; i < pads.pads.size(); ++i)
+        if (pads.pads[i].connected) { galaxy::sdl::rumble(pads.pad_ids[i], bt->rumble() ? 1.0f : 0.0f); break; }
+    }
     ok = cactus::game_frame(&g_cpu, g_pi_mask);
     if (!ok) break;
     pump_audio();
