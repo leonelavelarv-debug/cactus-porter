@@ -12,6 +12,7 @@
 #include "dev_di.h"
 #include "dev_fs.h"
 #include "dev_misc.h"
+#include "dsp_hle.h"
 #include "guest_memory.h"
 #include "sdl_host.h"
 #include "wii_boot.h"
@@ -97,15 +98,14 @@ static void di_transfer() {
 }
 
 // ---------------------------------------------------------------- DSP / AI
-// DSPCR (0xCC00500A): AIDINT 0x08, ARINT 0x20 y DSPINT 0x80 se limpian escribiendo 1; sus máscaras van un bit
-// más arriba. Los buzones del DSP (0x5000-0x5006) todavía no tienen HLE de microcódigo (AX).
-static uint16_t g_dspcr = 0;
-
-static void dsp_irq() {
-    const bool irq = ((g_dspcr & 0x08) && (g_dspcr & 0x10)) || ((g_dspcr & 0x20) && (g_dspcr & 0x40)) ||
-                     ((g_dspcr & 0x80) && (g_dspcr & 0x100));
-    if (irq) cactus::gx_pi_raise(0x40u);
+// DSPCR, buzones, arranque de microcódigo, AX y DMA de ARAM viven en dsp_hle.cpp. Aquí solo quedan el DMA de
+// audio hacia SDL (0x5030-0x503A) y la conexión con PI y la memoria del invitado.
+static void dsp_irq_line(bool on) {
+    if (on) cactus::gx_pi_raise(0x40u);
     else cactus::gx_pi_cause_exchange(0x40u);
+}
+static void dsp_mem_written(uint32_t addr, size_t length) {
+    galaxy::gx::notify_guest_memory_write(addr, uint32_t(length));
 }
 
 // DMA PCM del DSP. SDL recibe estéreo big-endian en bloques de 32 bytes.
@@ -146,8 +146,7 @@ static void pump_audio() {
         finished |= audio_dma.left == 0;
     }
     if (finished) {  // fin de bloque: el juego encola el siguiente en su interrupción AID
-        g_dspcr |= 0x08;
-        dsp_irq();
+        dsp::raise_status(0x08);  // AIDINT
     }
 }
 
@@ -184,8 +183,9 @@ static uint64_t mmio_read(CPUState* cpu, uint32_t ea, uint8_t size) {
     if (!io_page(ea)) return 0;
     if (ipc_register(ea)) return size == 4 ? ios::kernel().reg_read(ea) : 0;
     const uint32_t reg = ea & 0xffffu;
-    if (gx_page(ea) && size == 4 && ((reg < 0x80) || (reg >= 0x2000 && reg < 0x2080)))
+    if (gx_page(ea) && size == 4 && ((reg < 0x80) || (reg >= 0x2000 && reg < 0x2080) || (reg >= 0x5000 && reg < 0x5040)))
         return (mmio_read(cpu, ea, 2) << 16) | mmio_read(cpu, ea + 2, 2);
+    if (gx_page(ea) && dsp::handles(reg)) return dsp::read(reg);
     if (gx_page(ea) && reg < 0x80) return cp_read(reg);
     if (gx_page(ea) && reg >= 0x2000 && reg < 0x2080) return g_vi[(reg - 0x2000) / 2];
     switch (reg) {
@@ -194,7 +194,6 @@ static uint64_t mmio_read(CPUState* cpu, uint32_t ea, uint8_t size) {
     case 0x3000: return cactus::gx_pi_cause_exchange(0) | 0x10000u;  // RSWST: botón RESET suelto
     case 0x3004: return g_pi_mask;
     case 0x302c: return 0x246500B1u;  // revisión de Flipper/Hollywood
-    case 0x500a: return g_dspcr;
     case 0x6000: return di.status;
     case 0x6004: return di.cover;
     case 0x6008: case 0x600c: case 0x6010: return di.cmd[(reg-0x6008)/4];
@@ -229,7 +228,7 @@ static void mmio_write(CPUState* cpu, uint32_t ea, uint64_t value, uint8_t size)
         cactus::gx_fifo_write(bytes, size);
         return;
     }
-    if (gx_page(ea) && size == 4 && ((reg < 0x80) || (reg >= 0x2000 && reg < 0x2080))) {
+    if (gx_page(ea) && size == 4 && ((reg < 0x80) || (reg >= 0x2000 && reg < 0x2080) || (reg >= 0x5000 && reg < 0x5040))) {
         mmio_write(cpu, ea, value >> 16, 2);
         mmio_write(cpu, ea + 2, value & 0xffff, 2);
         return;
@@ -245,19 +244,18 @@ static void mmio_write(CPUState* cpu, uint32_t ea, uint64_t value, uint8_t size)
         }
         return;
     }
+    if (gx_page(ea) && dsp::handles(reg)) {
+        if (size == 2) dsp::write(reg, uint16_t(value));
+        return;
+    }
     uint32_t v = uint32_t(value);
     switch (reg) {
     case 0x100a: // PE_CONTROL: habilitaciones y acuses del token y de fin de dibujo.
         g_pe_ctrl = uint16_t(v & ~0xCu);
         cactus::gx_pi_cause_exchange(((v & 4) ? 0x200u : 0u) | ((v & 8) ? 0x400u : 0u));
         break;
-    case 0x3000: cactus::gx_pi_cause_exchange(v); di_irq(); vi_update(false); ipc_irq(cpu); dsp_irq(); break;
+    case 0x3000: cactus::gx_pi_cause_exchange(v); di_irq(); vi_update(false); ipc_irq(cpu); dsp::refresh_irq(); break;
     case 0x3004: g_pi_mask = v; break;
-    case 0x500a:
-        g_dspcr = uint16_t((v & ~0xA9u) | (g_dspcr & 0xA8u & ~v));
-        dsp_irq();
-        break;
-    case 0x502a: g_dspcr |= 0x20; dsp_irq(); break;  // DMA de ARAM: termina al instante
     case 0x6000: di.status = (di.status & 0x54u & ~v) | (v & 0x2au); di_irq(); break;
     case 0x6008: case 0x600c: case 0x6010: di.cmd[(reg-0x6008)/4] = v; break;
     case 0x6014: di.address = v & ~31u; break;
@@ -354,6 +352,7 @@ int main(int argc, char** argv) {
   ios::kernel().register_device("/dev/fs", fs);
   ios::kernel().register_device("/dev/di", std::make_shared<ios::DevDI>(g_pak));
   ios::register_misc_devices(ios::kernel(), boot.title_id);
+  dsp::init({guest_span, dsp_irq_line, dsp_mem_written});
 
   // La capa SDL del fork: ventana, mandos (base de PortMaster), combinación de salida y audio.
   if (!galaxy::sdl::start()) {
