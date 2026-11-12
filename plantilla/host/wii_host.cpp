@@ -1,14 +1,20 @@
 // wii_host.cpp — host del port: CPUState de DolRecomp + MMIO de Wii sobre SDL2.
-// GX/DSP/WPAD se completan por juego en juego_glue.cpp (renderer GLES de Nebula).
+// El renderer GLES de Nebula dibuja (gx_bridge.cpp); el CPU corre en juego_glue.cpp.
 #include <SDL.h>
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <sys/stat.h>
+#include <vector>
 #include "dev_di.h"
 #include "dev_fs.h"
+#include "dev_misc.h"
 #include "guest_memory.h"
+#include "sdl_host.h"
+#include "wii_boot.h"
 #include "wii_dvd.h"
 #include "wii_gx.h"
 #include "galaxy/gx_d3d12.h"
@@ -17,57 +23,54 @@ static wii::PakDisc g_pak;
 static CPUState g_cpu;
 static SDL_AudioDeviceID g_audio = 0;
 static uint32_t g_ai_rate = 32000;
-static std::atomic<bool> g_corriendo{true};
-
-// Estado GX/VI del host. end es exclusivo en este anillo.
-static struct { uint32_t base=0, end=0, wp=0, rp=0; bool started=false; } g_fifo;
-static uint16_t g_vi[0x40] = {};
-
-static void fifo_drain() {
-    const auto base = g_fifo.base, end = g_fifo.end, wp = g_fifo.wp;
-    if (end <= base || !g_cpu.ram || wp < base || wp >= end) return;
-    const uint32_t physical = base & 0x3FFFFFFFu;
-    if (physical >= g_cpu.ram_size || end - base > g_cpu.ram_size - physical) return;
-    uint32_t rp = g_fifo.started ? g_fifo.rp : base;
-    if (rp < base || rp >= end || rp == wp) return;
-    uint32_t count = wp >= rp ? wp - rp : (end - rp) + (wp - base);
-    while (count) {
-        uint32_t span = std::min({count, end - rp, 4096u});
-        cactus::gx_fifo_write(g_cpu.ram + physical + (rp - base), span);
-        rp += span;
-        if (rp == end) rp = base;
-        count -= span;
-    }
-    g_fifo.rp = wp;
-    g_fifo.started = true;
-    cactus::gx_pi_raise(0x800u);
-}
-
-static void cp_write(uint32_t reg, uint32_t v) {
-    auto lo = [](uint32_t& r, uint32_t x){ r = (r & 0xFFFF0000u) | (x & 0xFFFFu); };
-    auto hi = [](uint32_t& r, uint32_t x){ r = (r & 0x0000FFFFu) | ((x & 0xFFFFu) << 16); };
-    switch (reg) {
-        case 0x20: lo(g_fifo.base, v); g_fifo.started = false; break;
-        case 0x22: hi(g_fifo.base, v); g_fifo.started = false; break;
-        case 0x24: lo(g_fifo.end, v); break;
-        case 0x26: hi(g_fifo.end, v); break;
-        case 0x34: lo(g_fifo.wp, v); fifo_drain(); break;
-        case 0x36: hi(g_fifo.wp, v); fifo_drain(); break;
-        default: break;
-    }
-}
 
 static uint32_t g_pi_mask;
 static uint8_t* guest_span(uint32_t addr, size_t length) {
     return wii::resolve(&g_cpu, addr, length);
 }
 
-static uint32_t xfb_addr() {
-    uint32_t info = (uint32_t(g_vi[0x1c/2]) << 16) | g_vi[0x1e/2];
+// ---------------------------------------------------------------- CP / PE
+// Todo lo que el juego manda al GX pasa por el write-gather pipe (0xCC008000) y se entrega al renderer en
+// cuanto llega. El FIFO del CP queda siempre vacío y ocioso: sus punteros se guardan para que GX los relea,
+// pero no se vuelven a enviar (eso duplicaba el dibujo) ni levantan la interrupción del CP (que nadie limpiaba).
+static uint16_t g_cp[0x40] = {};
+static uint16_t g_pe_ctrl = 0;
+
+static uint16_t cp_read(uint32_t reg) {
+    switch (reg) {
+    case 0x00: return 0x000E;              // subdesbordado, lectura ociosa, órdenes ociosas
+    case 0x30: case 0x32: return 0;        // distancia lectura-escritura
+    case 0x38: return g_cp[0x34 / 2];      // puntero de lectura = de escritura
+    case 0x3A: return g_cp[0x36 / 2];
+    default: return reg < 0x80 ? g_cp[reg / 2] : 0;
+    }
+}
+
+static uint16_t pe_ctrl_read() {
+    const uint32_t cause = cactus::gx_pi_cause_exchange(0);
+    return uint16_t((g_pe_ctrl & ~0xCu) | ((cause & 0x200u) ? 4u : 0u) | ((cause & 0x400u) ? 8u : 0u));
+}
+
+static uint32_t xfb_addr(const uint16_t* vi) {
+    uint32_t info = (uint32_t(vi[0x1c/2]) << 16) | vi[0x1e/2];
     return (info & 0xffffffu) << ((info & (1u<<28)) ? 5 : 0);
 }
 
-// DI de lectura directa sobre el espacio lógico descifrado del game.pak.
+// ---------------------------------------------------------------- VI
+static uint16_t g_vi[0x40] = {};
+
+static void vi_update(bool retrace) {
+    bool irq = false;
+    for (unsigned reg = 0x30; reg <= 0x3c; reg += 4) {
+        uint16_t& high = g_vi[reg / 2];
+        if (retrace && (high & 0x1000)) high |= 0x8000;
+        irq |= (high & 0x9000) == 0x9000;
+    }
+    if (irq) cactus::gx_pi_raise(0x100u);
+    else cactus::gx_pi_cause_exchange(0x100u);
+}
+
+// ---------------------------------------------------------------- DI directo (estilo GameCube)
 static struct {
     uint32_t status, cover, cmd[3], address, length, control, immediate;
 } di;
@@ -93,6 +96,18 @@ static void di_transfer() {
     di_irq();
 }
 
+// ---------------------------------------------------------------- DSP / AI
+// DSPCR (0xCC00500A): AIDINT 0x08, ARINT 0x20 y DSPINT 0x80 se limpian escribiendo 1; sus máscaras van un bit
+// más arriba. Los buzones del DSP (0x5000-0x5006) todavía no tienen HLE de microcódigo (AX).
+static uint16_t g_dspcr = 0;
+
+static void dsp_irq() {
+    const bool irq = ((g_dspcr & 0x08) && (g_dspcr & 0x10)) || ((g_dspcr & 0x20) && (g_dspcr & 0x40)) ||
+                     ((g_dspcr & 0x80) && (g_dspcr & 0x100));
+    if (irq) cactus::gx_pi_raise(0x40u);
+    else cactus::gx_pi_cause_exchange(0x40u);
+}
+
 // DMA PCM del DSP. SDL recibe estéreo big-endian en bloques de 32 bytes.
 static struct {
     uint32_t source, cursor, control, left, ai_control;
@@ -115,6 +130,7 @@ static void pump_audio() {
     if (!g_audio || !(audio_dma.control & 0x8000) || !(audio_dma.control & 0x7fff)) return;
     const uint32_t target = (g_ai_rate / 30) * 4;
     uint32_t queued = SDL_GetQueuedAudioSize(g_audio);
+    bool finished = false;
     while (queued < target) {
         if (!audio_dma.left) {
             audio_dma.left = audio_dma.control & 0x7fff;
@@ -127,9 +143,15 @@ static void pump_audio() {
         audio_dma.cursor += n;
         audio_dma.left -= blocks;
         queued += n;
+        finished |= audio_dma.left == 0;
+    }
+    if (finished) {  // fin de bloque: el juego encola el siguiente en su interrupción AID
+        g_dspcr |= 0x08;
+        dsp_irq();
     }
 }
 
+// ---------------------------------------------------------------- MMIO
 static bool gx_page(uint32_t ea) {
     const uint32_t page = ea & 0xffff0000u;
     return page == 0xcc000000u || page == 0x0c000000u;
@@ -153,30 +175,26 @@ static void ipc_irq(CPUState*) {
         cactus::gx_pi_cause_exchange(1u << 14);
 }
 
-static void vi_update(bool retrace) {
-    bool irq = false;
-    for (unsigned reg = 0x30; reg <= 0x3c; reg += 4) {
-        uint16_t& high = g_vi[reg / 2];
-        if (retrace && (high & 0x1000)) high |= 0x8000;
-        irq |= (high & 0x9000) == 0x9000;
-    }
-    if (irq) cactus::gx_pi_raise(0x100u);
-    else cactus::gx_pi_cause_exchange(0x100u);
-}
-
 static uint64_t mmio_read(CPUState* cpu, uint32_t ea, uint8_t size) {
+    if (uint8_t* lc = cactus::locked_cache(ea, size)) {
+        uint64_t v = 0;
+        for (unsigned i = 0; i < size; ++i) v = (v << 8) | lc[i];
+        return v;
+    }
     if (!io_page(ea)) return 0;
     if (ipc_register(ea)) return size == 4 ? ios::kernel().reg_read(ea) : 0;
     const uint32_t reg = ea & 0xffffu;
-    if (reg >= 0x2000 && reg < 0x2080 && gx_page(ea)) {
-        if (size == 4 && reg <= 0x207c)
-            return (mmio_read(cpu, ea, 2) << 16) | mmio_read(cpu, ea+2, 2);
-        return g_vi[(reg-0x2000)/2];
-    }
+    if (gx_page(ea) && size == 4 && ((reg < 0x80) || (reg >= 0x2000 && reg < 0x2080)))
+        return (mmio_read(cpu, ea, 2) << 16) | mmio_read(cpu, ea + 2, 2);
+    if (gx_page(ea) && reg < 0x80) return cp_read(reg);
+    if (gx_page(ea) && reg >= 0x2000 && reg < 0x2080) return g_vi[(reg - 0x2000) / 2];
     switch (reg) {
+    case 0x100a: return pe_ctrl_read();
     case 0x100e: return cactus::gx_pe_token_value();
-    case 0x3000: return cactus::gx_pi_cause_exchange(0);
+    case 0x3000: return cactus::gx_pi_cause_exchange(0) | 0x10000u;  // RSWST: botón RESET suelto
     case 0x3004: return g_pi_mask;
+    case 0x302c: return 0x246500B1u;  // revisión de Flipper/Hollywood
+    case 0x500a: return g_dspcr;
     case 0x6000: return di.status;
     case 0x6004: return di.cover;
     case 0x6008: case 0x600c: case 0x6010: return di.cmd[(reg-0x6008)/4];
@@ -194,6 +212,10 @@ static uint64_t mmio_read(CPUState* cpu, uint32_t ea, uint8_t size) {
 }
 
 static void mmio_write(CPUState* cpu, uint32_t ea, uint64_t value, uint8_t size) {
+    if (uint8_t* lc = cactus::locked_cache(ea, size)) {
+        for (unsigned i = 0; i < size; ++i) lc[i] = uint8_t(value >> (8 * (size - 1 - i)));
+        return;
+    }
     if (!io_page(ea)) return;
     if (ipc_register(ea)) {
         if (size == 4) ios::kernel().reg_write(ea, uint32_t(value));
@@ -207,12 +229,17 @@ static void mmio_write(CPUState* cpu, uint32_t ea, uint64_t value, uint8_t size)
         cactus::gx_fifo_write(bytes, size);
         return;
     }
-    if (gx_page(ea) && reg < 0x100) { cp_write(reg, uint32_t(value)); return; }
+    if (gx_page(ea) && size == 4 && ((reg < 0x80) || (reg >= 0x2000 && reg < 0x2080))) {
+        mmio_write(cpu, ea, value >> 16, 2);
+        mmio_write(cpu, ea + 2, value & 0xffff, 2);
+        return;
+    }
+    if (gx_page(ea) && reg < 0x80) {
+        if (size == 2) g_cp[reg / 2] = uint16_t(value);
+        return;
+    }
     if (gx_page(ea) && reg >= 0x2000 && reg < 0x2080) {
-        if (size == 4 && reg <= 0x207c) {
-            mmio_write(cpu, ea, value >> 16, 2);
-            mmio_write(cpu, ea+2, value, 2);
-        } else if (size == 2) {
+        if (size == 2) {
             g_vi[(reg-0x2000)/2] = uint16_t(value);
             if (reg >= 0x2030 && reg <= 0x203e) vi_update(false);
         }
@@ -220,11 +247,17 @@ static void mmio_write(CPUState* cpu, uint32_t ea, uint64_t value, uint8_t size)
     }
     uint32_t v = uint32_t(value);
     switch (reg) {
-    case 0x100a: // PE_CONTROL: acuses del token y de fin de dibujo.
+    case 0x100a: // PE_CONTROL: habilitaciones y acuses del token y de fin de dibujo.
+        g_pe_ctrl = uint16_t(v & ~0xCu);
         cactus::gx_pi_cause_exchange(((v & 4) ? 0x200u : 0u) | ((v & 8) ? 0x400u : 0u));
         break;
-    case 0x3000: cactus::gx_pi_cause_exchange(v); di_irq(); vi_update(false); ipc_irq(cpu); break;
+    case 0x3000: cactus::gx_pi_cause_exchange(v); di_irq(); vi_update(false); ipc_irq(cpu); dsp_irq(); break;
     case 0x3004: g_pi_mask = v; break;
+    case 0x500a:
+        g_dspcr = uint16_t((v & ~0xA9u) | (g_dspcr & 0xA8u & ~v));
+        dsp_irq();
+        break;
+    case 0x502a: g_dspcr |= 0x20; dsp_irq(); break;  // DMA de ARAM: termina al instante
     case 0x6000: di.status = (di.status & 0x54u & ~v) | (v & 0x2au); di_irq(); break;
     case 0x6008: case 0x600c: case 0x6010: di.cmd[(reg-0x6008)/4] = v; break;
     case 0x6014: di.address = v & ~31u; break;
@@ -252,6 +285,16 @@ static void mmio_write(CPUState* cpu, uint32_t ea, uint64_t value, uint8_t size)
 }
 static void mmio_write32(CPUState* c, uint32_t ea, uint32_t v, uint8_t) { mmio_write(c, ea, v, 4); }
 
+// mkdir -p dentro de la NAND del juego.
+static bool make_dirs(const std::string& path) {
+    for (size_t at = 1; at <= path.size(); ++at) {
+        if (at != path.size() && path[at] != '/') continue;
+        const std::string part = path.substr(0, at);
+        if (mkdir(part.c_str(), 0700) != 0 && errno != EEXIST) return false;
+    }
+    return true;
+}
+
 int main(int argc, char** argv) {
   const char* pak_path = nullptr;
   const char* nand_path = "nand";
@@ -265,13 +308,8 @@ int main(int argc, char** argv) {
   if (!pak_path) { fprintf(stderr, "uso: %s --pak game.pak [--nand dir]\n", argv[0]); return 2; }
   if (!g_pak.open(pak_path)) { fprintf(stderr, "no se pudo abrir %s\n", pak_path); return 1; }
 
-  auto fs = ios::make_dev_fs(nand_path);
-  if (!fs) { perror(nand_path); return 1; }
   if (!cpu_init(&g_cpu)) return 1;
   if (!cpu_alloc_mem2(&g_cpu, WII_MEM2_SIZE)) return 1;   // MEM1 24 MiB + MEM2 64 MiB
-  ios::kernel().init(&g_cpu, ipc_irq);
-  ios::kernel().register_device("/dev/fs", fs);
-  ios::kernel().register_device("/dev/di", std::make_shared<ios::DevDI>(g_pak));
   g_cpu.external_read32 = [](CPUState* cpu, uint32_t ea, uint8_t) -> uint32_t {
     return uint32_t(mmio_read(cpu, ea, 4));
   };
@@ -295,12 +333,33 @@ int main(int argc, char** argv) {
   }
   const uint32_t entry = be32(dol.data() + 0xE0);
 
-  if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMECONTROLLER) != 0) {
-    std::fprintf(stderr, "SDL_Init: %s\n", SDL_GetError());
+  // Lo que el IPL, IOS y el apploader dejan en RAM antes de main.dol.
+  wii::BootInfo boot;
+  if (!wii::setup_boot_memory(&g_cpu, g_pak, boot)) {
+    std::fprintf(stderr, "No se pudo preparar el arranque desde %s\n", pak_path);
+    return 1;
+  }
+
+  // NAND del juego: su carpeta de datos (partidas) y las del sistema que el SDK espera.
+  char title_dir[64];
+  std::snprintf(title_dir, sizeof title_dir, "/title/%08x/%08x/data", uint32_t(boot.title_id >> 32),
+                uint32_t(boot.title_id));
+  for (const std::string& sub : {std::string(title_dir), std::string("/shared2/sys"), std::string("/tmp"),
+                                std::string("/sys")}) {
+    if (!make_dirs(std::string(nand_path) + sub)) { perror((std::string(nand_path) + sub).c_str()); return 1; }
+  }
+  auto fs = ios::make_dev_fs(nand_path);
+  if (!fs) { perror(nand_path); return 1; }
+  ios::kernel().init(&g_cpu, ipc_irq);
+  ios::kernel().register_device("/dev/fs", fs);
+  ios::kernel().register_device("/dev/di", std::make_shared<ios::DevDI>(g_pak));
+  ios::register_misc_devices(ios::kernel(), boot.title_id);
+
+  // La capa SDL del fork: ventana, mandos (base de PortMaster), combinación de salida y audio.
+  if (!galaxy::sdl::start()) {
     cpu_free(&g_cpu);
     return 1;
   }
-  // El backend KNULLI crea la única ventana fbdev y su contexto EGL.
   audio_dma.ai_control = 0x40;
   open_audio(g_ai_rate);
   if (!cactus::gx_init(&g_cpu, 640, 480)) {
@@ -316,21 +375,19 @@ int main(int argc, char** argv) {
   bool ok = cactus::game_init(&g_cpu, entry);
 
   const double freq = double(SDL_GetPerformanceFrequency());
-  while (ok && g_corriendo.load() && !cactus::gx_quit_requested()) {
+  const double period = boot.pal ? 1.0 / 50.0 : 1.0 / 60.0;
+  while (ok) {
     const Uint64 t0 = SDL_GetPerformanceCounter();
-    SDL_Event ev;
-    while (SDL_PollEvent(&ev)) {
-      if (ev.type == SDL_QUIT) g_corriendo = false;
-      if (ev.type == SDL_CONTROLLERBUTTONDOWN && ev.cbutton.button == SDL_CONTROLLER_BUTTON_START)
-        g_corriendo = false;  // PUNTO DE INTEGRACIÓN: combo de salida del fork (NEBULA_QUIT_COMBO)
-    }
-    if (!g_corriendo.load()) break;
+    // Eventos y mandos los atiende la capa del fork; MENU/SELECT + Start pide salir.
+    galaxy::sdl::pump_events(0);
+    if (cactus::gx_quit_requested() || ios::kernel().shutdown_requested()) break;
     ok = cactus::game_frame(&g_cpu, g_pi_mask);
     if (!ok) break;
     pump_audio();
     vi_update(true);
-    cactus::gx_frame(true, xfb_addr());
-    while ((SDL_GetPerformanceCounter() - t0) / freq < 1.0/60.0) SDL_Delay(1);
+    cactus::gx_frame(true, xfb_addr(g_vi));
+    const double left = period - double(SDL_GetPerformanceCounter() - t0) / freq;
+    if (left > 0.001) SDL_Delay(Uint32(left * 1000.0));
   }
   ppc_set_mem_write_journal(nullptr, nullptr);
   cactus::gx_shutdown();

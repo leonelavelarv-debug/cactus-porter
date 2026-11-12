@@ -1,13 +1,18 @@
 // Despacho IPC y registro de dispositivos IOS.
 #pragma once
 #include "ios_constants.h"
+#include <deque>
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <utility>
 
 struct CPUState;
 
 namespace ios {
+
+// Resultado de un dispositivo que contestará más tarde con Kernel::queue_reply (p. ej. /dev/stm/eventhook).
+inline constexpr s32 IPC_NO_REPLY = INT32_MIN;
 
 struct Device {
     virtual ~Device() = default;
@@ -30,6 +35,13 @@ class Kernel {
     u32 reg_read(u32 addr);
     void reg_write(u32 addr, u32 value);
 
+    // Dirección física de la petición que se está procesando y respuesta diferida para ella.
+    u32 current_request() const { return current_; }
+    void queue_reply(u32 req_addr, s32 result);
+    // Un juego pidió apagar o volver al menú (STM).
+    bool shutdown_requested() const { return shutdown_; }
+    void request_shutdown() { shutdown_ = true; }
+
  private:
     struct Slot { std::shared_ptr<Device> dev; s32 handle = -1; };
     CPUState* cpu_ = nullptr;
@@ -38,8 +50,11 @@ class Kernel {
     Slot slots_[32];
     std::unordered_map<std::string, std::shared_ptr<Device>> devices_;
 
-    u32 accepted_ = 0, irq_flags_ = 0, irq_mask_ = 0;
+    u32 accepted_ = 0, irq_flags_ = 0, irq_mask_ = 0, current_ = 0;
+    bool shutdown_ = false;
+    std::deque<std::pair<u32, s32>> replies_;
     void update_irq();
+    void deliver();
     u8* guest_ptr(u32 addr, u32 len);
     void process(u32 req_addr);
     void reply(u32 req_addr, s32 result);

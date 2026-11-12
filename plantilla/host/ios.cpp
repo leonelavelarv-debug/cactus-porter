@@ -2,6 +2,8 @@
 #include "ios.h"
 #include "guest_memory.h"
 #include <array>
+#include <cstdio>
+#include <set>
 #include <utility>
 
 namespace ios {
@@ -24,7 +26,9 @@ void Kernel::init(CPUState* cpu, IrqFn irq) {
     }
     cpu_ = cpu;
     irq_ = irq;
-    accepted_ = ppcmsg_ = ppcctrl_ = armmsg_ = irq_flags_ = 0;
+    accepted_ = ppcmsg_ = ppcctrl_ = armmsg_ = irq_flags_ = current_ = 0;
+    shutdown_ = false;
+    replies_.clear();
     irq_mask_ = ipc_interrupt;
     update_irq();
 }
@@ -49,7 +53,11 @@ s32 Kernel::do_open(const char* path, u32 mode) {
     if (it == devices_.end() && !name.empty() && name.front() == '/' &&
         name != "/dev" && name.compare(0, 5, "/dev/") != 0)
         it = devices_.find("/dev/fs");
-    if (it == devices_.end()) return IPC_ENOENT;
+    if (it == devices_.end()) {
+        static std::set<std::string> logged;
+        if (logged.insert(name).second) std::fprintf(stderr, "[ios] sin dispositivo %s\n", path);
+        return IPC_ENOENT;
+    }
     auto dev = it->second;
     for (s32 fd = 0; fd < 32; ++fd) {
         if (slots_[fd].dev) continue;
@@ -81,6 +89,7 @@ s32 Kernel::do_ioctlv(s32 fd, u32 req, u32 nin, u32 nout, u32 address) {
 
 void Kernel::process(u32 address) {
     u8* req = guest_ptr(address, request_size);
+    current_ = address;
     if (!req) {
         reply(address, IPC_EINVAL);
         return;
@@ -130,12 +139,26 @@ void Kernel::process(u32 address) {
             break;
         }
     }
-    reply(address, result);
+    if (result != IPC_NO_REPLY) reply(address, result);
 }
 
 void Kernel::reply(u32 address, s32 result) {
+    replies_.emplace_back(address, result);
+    deliver();
+}
+
+void Kernel::queue_reply(u32 address, s32 result) {
+    reply(address, result);
+    update_irq();
+}
+
+// Una respuesta a la vez en ARMMSG: la siguiente sale cuando el PPC confirma Y1.
+void Kernel::deliver() {
+    if ((ppcctrl_ & response) || replies_.empty()) return;
+    const auto [address, result] = replies_.front();
+    replies_.pop_front();
     if (u8* req = guest_ptr(address, request_size)) {
-        wbe32(req + 8, be32(req));
+        wbe32(req + 8, be32(req));  // IOS devuelve el comando en el campo fd
         wbe32(req + 4, u32(result));
         wbe32(req, IOS_REPLY);
     }
@@ -169,6 +192,7 @@ void Kernel::reg_write(u32 addr, u32 value) {
         ppcctrl_ &= ~(value & (ack | response));
         ppcctrl_ &= ~(enable_ack | enable_response);
         ppcctrl_ |= value & (enable_ack | enable_response | send);
+        deliver();
         if (acknowledged) process(accepted_);
         // Mantener X1 pendiente mientras el PPC consume la respuesta anterior.
         if ((ppcctrl_ & (send | ack | response)) == send) {

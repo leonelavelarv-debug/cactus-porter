@@ -4,17 +4,17 @@ Plantilla en desarrollo para armar ports de Wii para Anbernic RG35XX H. El flujo
 
 ## Preparar el PC
 
-Desde la raíz del proyecto, en Ubuntu o Debian:
+Desde la raíz del proyecto, en Ubuntu 24.04 (WSL2 sirve):
 
 ```bash
-sudo apt install git cmake ninja-build g++ clang lld zlib1g-dev libbz2-dev liblzma-dev libzstd-dev
-export AARCH64_XTOOLS=/ruta/x-tools/aarch64-rpi3-linux-gnu
-export CACTUS_SDL2_PREFIX=/ruta/sdl2-aarch64
+sudo apt install git cmake ninja-build g++ python3
+./cactus-porter.py fetch                 # DolRecomp y tu fork cactus-galaxy (rama rg35xxh-arm64)
+./instalar-entorno-nebula-v2.sh          # toolchain aarch64 (glibc 2.27), SDL2 aarch64, glslang y SPIRV-Cross
+source ~/nebula-entorno/entorno.sh
 ./cactus-porter.py doctor
-./cactus-porter.py fetch
 ```
 
-Sustituye las rutas por las de tu toolchain aarch64 con glibc ≤ 2.27 y tu SDL2 compilado para aarch64. La guía de referencia del fork es `docs/RG35XXH.md`. Repite los dos `export` al abrir una terminal nueva, salvo que ya estén en la configuración de tu shell.
+`fetch` necesita acceso a tu repositorio privado cactus-galaxy (`gh auth login` o una llave SSH). La sonda de `probe` se compila con el zlib/xz/zstd/bzip2 que trae el fork, así que no hacen falta paquetes `-dev` del sistema. Repite el `source` al abrir una terminal nueva.
 
 ## Preparar cada juego
 
@@ -25,7 +25,7 @@ Sustituye las rutas por las de tu toolchain aarch64 con glibc ≤ 2.27 y tu SDL2
 ./cactus-porter.py package --juego XXXX01
 ```
 
-Usa tu propio disco. Sustituye `XXXX01` por el ID que indique `probe`. El perfil y el DOL se guardan en `trabajo/<ID>/`. Si careces del mapa del enlazador, omite `--map main.map`. La ruta prevista del paquete es `salida/<slug>.zip`.
+Usa tu propio disco. Sustituye `XXXX01` por el ID que indique `probe`. El lanzador `.sh` toma el nombre del juego sin `: / \ * ? " < > |`, que la SD en exFAT/FAT32 y Windows no admiten. El perfil y el DOL se guardan en `trabajo/<ID>/`. Si careces del mapa del enlazador, omite `--map main.map`. La ruta prevista del paquete es `salida/<slug>.zip`.
 
 ## Primera ejecución prevista en la RG35XX H
 
@@ -74,14 +74,29 @@ El resultado esperado de `file` es un ELF de 64 bits para AArch64. El arranque s
 
 ## Estado de esta entrega
 
-El host cuenta con su CMakeLists.txt y el puente GX. El comando build configura el host con las fuentes C generadas para el juego y el checkout de cactus-galaxy. El backend C despacha bloques con un presupuesto por retrace. El PI entrega interrupciones externas al vector 0x500 si la máscara y MSR[EE] lo permiten. El vector debe tener código recompilado accesible. El modelo VI agrupa las interrupciones de pantalla por retrace. DI cubre lecturas directas 0xA8 del espacio descifrado y audio cubre DMA PCM. Los servicios IOS/DVD, DSP/AX y WPAD que necesite cada juego, los módulos dinámicos y las pruebas en hardware siguen pendientes.
+Hecho y probado en PC:
 
-### Prueba del despacho en PC
+- **CPU** (`juego_glue.cpp`): el backend C de DolRecomp deja al host los `mfspr`/`mtspr` fuera de su tabla (HID0, HID4, DEC, SPRG, BAT, WPAR, DMA, L2CR…) y `icbi`; el host los ejecuta. El stub `__OSExceptionVector` que OSInit copia a 0x500, 0x800, 0x900… no está recompilado: el host hace su trabajo (guarda el contexto y salta a `__OSExceptionTable`). Las excepciones del juego (FPU no disponible, DSI, programa) van al manejador del OS en vez de cerrar el port. Timebase a 60,75 MHz, decrementador con interrupción y locked cache (0xE0000000 con su DMA).
+- **Presupuesto**: 12,15 M ciclos de Broadway por retrace, en porciones de 2048 para que las interrupciones entren a tiempo, con un tope de 14 ms reales (`CACTUS_CPU_MS`). `CACTUS_TRACE=1` registra PC/LR cada segundo.
+- **Arranque** (`wii_boot.cpp`): memoria baja del OS como la deja el apploader (valores de Dolphin), bi2.bin, la FST bajo el final de MEM1 (DVDOpen) y setting.txt cifrado según la región.
+- **IOS**: respuestas diferidas en IPC, `/dev/di` con las órdenes que usa la biblioteca DVD, `/dev/es` (ID del título y carpeta de datos para NANDInit), `/dev/stm/eventhook` e `immediate` (apagar o volver al menú cierra el port). La NAND crea `title/00010000/<ID>/data`. Los dispositivos que falten se registran en log.txt como `[ios] sin dispositivo`.
+- **MMIO**: el FIFO del CP ya no reenvía lo que llegó por el write-gather pipe (dibujaba dos veces) ni deja la interrupción del CP levantada para siempre. PI informa el botón RESET suelto; PE guarda sus habilitaciones; DSPCR y la interrupción AID del DMA de audio.
+- **SDL**: el host usa la capa del fork (`galaxy::sdl::start` y `pump_events`), así que los mandos se abren con la base de PortMaster y se sale con MENU/SELECT + Start. Antes Start solo cerraba el juego.
 
-Con DolRecomp compilado en el PC y sus fuentes disponibles:
+Pendiente, por orden de bloqueo:
+
+1. **DSP/AX**: los juegos con AX esperan correo del DSP en AXInit y se quedan ahí. Hace falta un HLE del microcódigo AX.
+2. **WPAD**: no hay `/dev/usb/oh1/57e/305` (Bluetooth): el juego no ve Wiimotes. Hay que traducir el mando SDL a un Wiimote emulado.
+3. **SYSCONF**: sin `/shared2/sys/SYSCONF` en la NAND, algunos juegos muestran un error de configuración.
+4. Módulos REL, validación del GX en la consola y pruebas en hardware.
+
+### Pruebas en PC
+
+Con DolRecomp compilado (`trabajo/dolrecomp-build/dolrecomp`, lo deja `recomp`):
 
 ```bash
-./tests/dispatch.sh "$PWD/trabajo/dolrecomp-build/dolrecomp" "$PWD/fuentes/DolRecomp"
+dr="$PWD/fuentes/DolRecomp"; exe="$PWD/trabajo/dolrecomp-build/dolrecomp"
+./tests/dispatch.sh "$exe" "$dr"   # despacho, máscaras, vector externo y rfi
+./tests/runtime.sh "$exe" "$dr"    # SPR por fallback, icbi, decrementador y vector del OS en el host
+./tests/ios.sh "$dr"               # memoria de arranque, FST, IPC, ES, DI y eventhook diferido
 ```
-
-Genera un DOL mínimo en un directorio temporal y comprueba el contador del juego, las máscaras de interrupción, la entrada al vector externo y el retorno al código interrumpido.

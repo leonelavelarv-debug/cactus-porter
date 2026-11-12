@@ -30,24 +30,25 @@ def run(cmd, cwd=None, env=None, check=True, capture=False):
         sys.exit(f"!! falló ({p.returncode}): {' '.join(cmd)}")
     return p
 
+DEPS = FUENTES / "deps"
+
 def fork():  return FUENTES / "cactus-galaxy"
 def dolr():  return FUENTES / "DolRecomp"
 
 # ---------------------------------------------------------------- doctor
 def cmd_doctor(_):
     ok = True
-    for tool in ("git", "cmake", "g++", "python3", "clang", "clang++", "ld.lld"):
+    for tool in ("git", "cmake", "ninja", "g++", "python3", "clang", "clang++", "ld.lld"):
         tiene = shutil.which(tool) is not None
         print(f"  [{'x' if tiene else ' '}] {tool}")
         ok &= tiene
-    probe = "#include <zlib.h>\n#include <bzlib.h>\n#include <lzma.h>\n#include <zstd.h>\nint main(){return 0;}\n"
-    t = TRABAJO / "doctor"; t.mkdir(parents=True, exist_ok=True)
-    (t / "h.c").write_text(probe)
-    p = subprocess.run(["g++", "-x", "c++", str(t/"h.c"), "-o", str(t/"h"),
-                        "-lz", "-lbz2", "-llzma", "-lzstd"], capture_output=True) if shutil.which("g++") else None
-    ok &= bool(p and p.returncode == 0)
-    print(f"  [{'x' if p and p.returncode==0 else ' '}] zlib/bzip2/lzma/zstd de desarrollo (sonda del PC)")
-    if not p or p.returncode: print("      Ubuntu/Debian: sudo apt install zlib1g-dev libbz2-dev liblzma-dev libzstd-dev")
+    for nombre in ("cactus-galaxy", "DolRecomp"):
+        tiene = (FUENTES / nombre).is_dir()
+        print(f"  [{'x' if tiene else ' '}] fuentes/{nombre} (fetch)")
+        ok &= tiene
+    deps_ok = all((DEPS / d).is_dir() for d in ("glslang", "SPIRV-Cross"))
+    print(f"  [{'x' if deps_ok else ' '}] fuentes/deps: glslang y SPIRV-Cross (instalar-entorno-nebula-v2.sh)")
+    ok &= deps_ok
     xt = os.environ.get("AARCH64_XTOOLS", "")
     xt_ok = bool(xt and (Path(xt) / "aarch64-rpi3-linux-gnu/sysroot").is_dir())
     ok &= xt_ok
@@ -75,6 +76,8 @@ def cmd_fetch(_):
             run(["git", "submodule", "update", "--init", "--recursive"], cwd=dst)
         elif run(["git", "branch", "--show-current"], cwd=dst, capture=True).stdout.strip() != "rg35xxh-arm64":
             sys.exit(f"!! Cambia {dst} a la rama rg35xxh-arm64 antes de compilar.")
+    if not DEPS.is_dir():
+        print("Falta fuentes/deps (glslang, SPIRV-Cross): ejecuta ./instalar-entorno-nebula-v2.sh")
 
 # ------------------------------------------------- parche de nebula-pak
 TMD_NEW = '''void validate_tmd(const std::vector<u8>& tmd) {  // cactus-porter: cualquier juego Wii
@@ -98,6 +101,11 @@ def parchear_nebula_pak(src: str, perfil: dict, modos_cpp: str) -> str:
     region = perfil.get("region", "USA")
     sha    = perfil.get("dol_sha1") or "0" * 40
     pb     = int(perfil.get("part_bytes") or 0)
+    def ancla(patron, etiqueta, flags=0):
+        m = re.search(patron, src, flags)
+        if not m:
+            sys.exit(f"!! parche '{etiqueta}': ancla no encontrada en nebula_pak.cpp (¿cambió el fork?)")
+        return m.group(0)
     def uno(viejo, nuevo, etiqueta):
         nonlocal src
         if src.count(viejo) != 1:
@@ -105,11 +113,11 @@ def parchear_nebula_pak(src: str, perfil: dict, modos_cpp: str) -> str:
         src = src.replace(viejo, nuevo, 1)
     uno('constexpr const char* kGameId = "RMGE01";',
         f'constexpr const char* kGameId = "{gid}";', "kGameId")
-    uno(re.search(r'constexpr const char\* kDolSha1 = "[0-9a-f]{40}";', src).group(0),
+    uno(ancla(r'constexpr const char\* kDolSha1 = "[0-9a-f]{40}";', "kDolSha1"),
         f'constexpr const char* kDolSha1 = "{sha}";', "kDolSha1")
-    uno(re.search(r'constexpr u64 kPartitionDataBytes = 0x[0-9a-fA-F]+;', src).group(0),
+    uno(ancla(r'constexpr u64 kPartitionDataBytes = 0x[0-9a-fA-F]+;', "kPartitionDataBytes"),
         f'constexpr u64 kPartitionDataBytes = 0x{pb:x};', "kPartitionDataBytes")
-    uno(re.search(r'void validate_tmd\(const std::vector<u8>& tmd\) \{.*?\n\}', src, re.S).group(0),
+    uno(ancla(r'void validate_tmd\(const std::vector<u8>& tmd\) \{.*?\n\}', "validate_tmd", re.S),
         TMD_NEW, "validate_tmd")
     ancla = '  if (argc != 3) {\n    fprintf(stderr, "uso: nebula-pak'
     uno(ancla, modos_cpp + ancla, "modos")
@@ -128,13 +136,14 @@ def cmd_probe(args):
     iso = Path(args.iso).resolve()
     if not iso.exists(): sys.exit(f"!! no existe {iso}")
     t = TRABAJO / "sonda"; t.mkdir(parents=True, exist_ok=True)
-    modos = (PLANTILLA / "parche" / "modos.cpp").read_text()
-    src = parchear_nebula_pak(fuente_original(fork()/"platform/knulli/pak/nebula_pak.cpp"),
-                              {"id": "WII000", "nombre": "juego Wii", "part_bytes": 0}, modos)
-    cpp = t / "cactus_pak_sonda.cpp"; cpp.write_text(src)
-    exe = t / "cactus-pak-sonda"
-    run(["g++", "-O2", "-std=c++17", cpp, "-o", exe, "-lz", "-lbz2", "-llzma", "-lzstd", "-pthread"])
-    out = run([exe, "--probe", iso], capture=True).stdout.strip().split("\t")
+    # Sonda nativa del PC con el CMake del fork y su zlib/xz/zstd/bzip2 vendorizados (sin paquetes -dev).
+    pak_src = preparar_pak({"id": "WII000", "nombre": "juego Wii", "part_bytes": 0}, t)
+    b = t / "build"
+    gen = ["-G", "Ninja"] if shutil.which("ninja") else []
+    run(["cmake", "-S", pak_src, "-B", b, *gen, "-DCMAKE_BUILD_TYPE=Release"])
+    run(["cmake", "--build", b, "--target", "nebula-pak"])
+    exe = b / "nebula-pak"
+    out = run([exe, "--probe", iso], capture=True).stdout.rstrip("\n").split("\t")
     if len(out) != 5: sys.exit("!! --probe no devolvió el perfil (¿disco de Wii válido?)")
     gid, formato, nombre, sha, pb = out
     perfil = {"id": gid, "nombre": nombre, "region": args.region, "formato": formato,
@@ -155,7 +164,7 @@ def cmd_recomp(args):
     run(["cmake", "-S", dolr(), "-B", b, "-DCMAKE_BUILD_TYPE=Release"])
     run(["cmake", "--build", b, "--target", "dolrecomp", "--config", "Release", "-j", str(os.cpu_count() or 4)])
     exe = b / "dolrecomp"
-    cmd = [exe, "--cpu", "broadway"]
+    cmd = [exe, f"-j{os.cpu_count() or 4}", "--cpu", "broadway"]
     if args.map:    cmd += ["--map", args.map]
     if args.config: cmd += ["--config", args.config]
     gid = perfil["id"]
@@ -195,6 +204,8 @@ def cmd_restore(_):
 
 def entorno_cross():
     env = dict(os.environ)
+    if not all((DEPS / d).is_dir() for d in ("glslang", "SPIRV-Cross")):
+        sys.exit("!! falta fuentes/deps (glslang, SPIRV-Cross): ejecuta ./instalar-entorno-nebula-v2.sh")
     if not env.get("AARCH64_XTOOLS"):
         sys.exit("!! falta AARCH64_XTOOLS (raíz del crosstool-NG aarch64-rpi3-linux-gnu)")
     if not env.get("CACTUS_SDL2_PREFIX"):
@@ -243,7 +254,9 @@ def cmd_package(args):
     lanzador = (PLANTILLA/"port/lanzador.sh").read_text()
     for k, v in [("@TITULO@", perfil["nombre"]), ("@ID@", gid), ("@SLUG@", slug)]:
         lanzador = lanzador.replace(k, v)
-    sh = puerto / f"{perfil['nombre']}.sh"; sh.write_text(lanzador); sh.chmod(0o755)
+    # Sin : / \\ * ? " < > | (exFAT/FAT32 de la SD y Windows no los admiten en nombres de fichero).
+    titulo_fs = re.sub(r'[\\/:*?"<>|]+', " -", perfil["nombre"]).strip(" .") or slug
+    sh = puerto / f"{titulo_fs}.sh"; sh.write_text(lanzador); sh.chmod(0o755)
     port_json = {
         "version": 4, "name": f"{slug}.zip",
         "items": [sh.name, f"{slug}/"], "items_opt": None,
