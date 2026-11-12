@@ -1,0 +1,13 @@
+/fuentes/
+/trabajo/
+/salida/
+__pycache__/
+*.pyc
+*.iso
+*.wbfs
+*.rvz
+*.wia
+*.gcz
+*.ciso
+*.dol
+*.pak
