@@ -8,6 +8,8 @@
 #include <dirent.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <string>
+#include <vector>
 
 namespace ios {
 namespace {
@@ -40,6 +42,36 @@ std::string path_arg(const u8* data, u32 length) {
 }
 
 struct Usage { uint64_t blocks = 0, inodes = 0; };
+
+// Nombres de un directorio (sin . ni ..), ordenados. Consume el descriptor.
+bool list_dir(int fd, std::vector<std::string>& names) {
+    DIR* dir = fdopendir(fd);
+    if (!dir) { ::close(fd); return false; }
+    errno = 0;
+    while (auto* e = readdir(dir)) {
+        if (strcmp(e->d_name, ".") && strcmp(e->d_name, "..")) names.emplace_back(e->d_name);
+        errno = 0;
+    }
+    const bool ok = errno == 0;
+    closedir(dir);
+    std::sort(names.begin(), names.end());
+    return ok;
+}
+
+// IOS borra los directorios con todo lo que tengan dentro.
+bool remove_tree(int dirfd, const char* name, unsigned depth = 0) {
+    if (!unlinkat(dirfd, name, 0)) return true;
+    if ((errno != EISDIR && errno != EPERM) || depth > 64) return false;
+    const int fd = openat(dirfd, name, O_DIRECTORY | O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) return false;
+    const int self = dup(fd);
+    std::vector<std::string> names;
+    if (self < 0 || !list_dir(fd, names)) { if (self >= 0) ::close(self); return false; }
+    bool ok = true;
+    for (const std::string& n : names) ok = ok && remove_tree(self, n.c_str(), depth + 1);
+    ::close(self);
+    return ok && !unlinkat(dirfd, name, AT_REMOVEDIR);
+}
 
 // Consume el descriptor incluso cuando falla la enumeración.
 s32 usage_dir(int fd, Usage& usage, unsigned depth) {
@@ -138,6 +170,11 @@ class DevFS final : public Device {
             out[70] = 3; // Perfil local de un solo usuario, lectura y escritura.
             return IPC_OK;
         }
+        if (req == IOCTL_FS_SET_ATTR) {  // dueño y permisos: la NAND del host no los guarda
+            if (!in || n < 74) return invalid;
+            struct stat st{};
+            return attributes(path_arg(in + 6, 64), st);
+        }
         if (req == IOCTL_FS_DELETE) return mutate(req, path_arg(in,n), {});
         if (req == IOCTL_FS_RENAME && in && n >= 128)
             return mutate(req, path_arg(in,64), path_arg(in+64,64));
@@ -171,6 +208,39 @@ class DevFS final : public Device {
             if (rc < 0) return rc;
             if (usage.blocks > UINT32_MAX || usage.inodes > UINT32_MAX) return invalid;
             wbe32(v[1].data,u32(usage.blocks)); wbe32(v[2].data,u32(usage.inodes));
+            return IPC_OK;
+        }
+        if (req == IOCTL_FS_READ_DIR && v && (nin == 1 || nin == 2) && nout == nin) {
+            // Entradas: ruta (y máximo de nombres). Salidas: el número, o los nombres separados por NUL y el número.
+            const std::string path = path_arg(v[0].data, v[0].len);
+            int fd;
+            Parent p;
+            if (path == "/") fd = openat(root_, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+            else {
+                const s32 rc = parent(path, p);
+                if (rc < 0) return rc;
+                fd = openat(p.fd, p.name.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+            }
+            if (fd < 0) return error();
+            std::vector<std::string> names;
+            if (!list_dir(fd, names)) return error();
+            if (nin == 1) {
+                if (!v[1].data || v[1].len < 4) return invalid;
+                wbe32(v[1].data, u32(names.size()));
+                return IPC_OK;
+            }
+            if (!v[1].data || v[1].len < 4 || !v[3].data || v[3].len < 4) return invalid;
+            const u32 max = be32(v[1].data);
+            if (v[2].data && v[2].len) memset(v[2].data, 0, v[2].len);
+            u32 count = 0;
+            size_t offset = 0;
+            for (const std::string& n : names) {
+                if (count >= max || !v[2].data || offset + n.size() + 1 > v[2].len) break;
+                memcpy(v[2].data + offset, n.c_str(), n.size() + 1);
+                offset += n.size() + 1;
+                ++count;
+            }
+            wbe32(v[3].data, count);
             return IPC_OK;
         }
         if (nout) return invalid;
@@ -219,9 +289,7 @@ class DevFS final : public Device {
         }
         case IOCTL_FS_CREATE_DIR: return mkdirat(p.fd,name,0700) ? error() : IPC_OK;
         case IOCTL_FS_DELETE:
-            if (!unlinkat(p.fd,name,0)) return IPC_OK;
-            if (errno != EISDIR) return error();
-            return unlinkat(p.fd,name,AT_REMOVEDIR) ? error() : IPC_OK;
+            return remove_tree(p.fd, name) ? IPC_OK : error();
         case IOCTL_FS_RENAME: {
             Parent dest;
             rc = parent(dst, dest);

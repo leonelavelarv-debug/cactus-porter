@@ -19,6 +19,9 @@ bool     gx_quit_requested();
 // Runtime del CPU sobre el C generado (juego_glue.cpp).
 bool     game_init(CPUState* cpu, uint32_t entry);       // MSR, SPR y ganchos de DolRecomp
 bool     game_frame(CPUState* cpu, const uint32_t& pi_mask);  // un retrace de trabajo del juego
+void     set_retrace_hz(int hz);                         // 60 (NTSC/EuRGB60) o 50 (PAL): ciclos por retrace
+// Se llama tras cada porción de CPU con los ciclos emulados: lo que avanza con el tiempo del juego (DMA de audio).
+void     set_slice_hook(void (*hook)(int64_t cycles));
 // Locked cache (0xE0000000, 16 KiB): nullptr si [ea, ea+size) no cae dentro.
 uint8_t* locked_cache(uint32_t ea, std::size_t size);
 }

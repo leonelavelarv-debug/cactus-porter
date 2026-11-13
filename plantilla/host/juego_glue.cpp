@@ -22,7 +22,9 @@ extern "C" {
 namespace {
 constexpr uint32_t kMsrEE = 0x8000, kMsrFP = 0x2000, kMsrIR = 0x20, kMsrDR = 0x10, kMsrRI = 0x2;
 constexpr uint32_t kRfiMask = 0x87C0FFFFu;
-constexpr int64_t kCyclesPerRetrace = 729000000 / 60;  // Broadway a 729 MHz, 60 Hz
+constexpr int64_t kBroadwayHz = 729000000;              // Broadway a 729 MHz
+int64_t g_cycles_per_retrace = kBroadwayHz / 60;          // 60 Hz; PAL a 50 Hz: set_retrace_hz
+void (*g_slice_hook)(int64_t) = nullptr;
 constexpr int64_t kSliceCycles = 2048;                   // latencia máxima de interrupción por despacho
 constexpr uint32_t kCyclesPerTick = 12;                  // timebase = bus (243 MHz) / 4
 constexpr uint32_t kBroadwayPvr = 0x00087102u;
@@ -252,11 +254,15 @@ bool game_init(CPUState* cpu, uint32_t entry) {
     return true;
 }
 
+void set_retrace_hz(int hz) { g_cycles_per_retrace = kBroadwayHz / (hz > 0 ? hz : 60); }
+void set_slice_hook(void (*hook)(int64_t)) { g_slice_hook = hook; }
+
 bool game_frame(CPUState* cpu, const uint32_t& pi_mask) {
     CACTUS_ZONA("CPU: código recompilado");
     using clock = std::chrono::steady_clock;
     const auto deadline = clock::now() + std::chrono::milliseconds(rt.slice_ms);
-    int64_t remaining = kCyclesPerRetrace;
+    const int64_t budget = g_cycles_per_retrace;
+    int64_t remaining = budget;
     uint32_t dispatches = 0;
     for (uint32_t n = 1; remaining > 0; ++n) {
         if (cpu->msr & kMsrEE) {
@@ -278,6 +284,7 @@ bool game_frame(CPUState* cpu, const uint32_t& pi_mask) {
         }
         remaining -= std::max<int64_t>(used, 1);
         advance_timebase(cpu, std::max<int64_t>(used, 1));
+        if (g_slice_hook) g_slice_hook(std::max<int64_t>(used, 1));
         if (cpu->exception) {
             const uint32_t e = cpu->exception;
             if ((e & PPC_EXC_MACHINE_CHECK) || (rt.trace && rt.logged_exceptions < 64) ||
@@ -299,8 +306,8 @@ bool game_frame(CPUState* cpu, const uint32_t& pi_mask) {
     }
     // La métrica principal: cuánto de un retrace de Broadway se emuló dentro del tope de tiempo. Por debajo
     // de 100 %, el juego va más lento que en la Wii.
-    CACTUS_GRAFICA("CPU: % del retrace emulado", 100.0 * double(kCyclesPerRetrace - std::max<int64_t>(remaining, 0)) /
-                                                   double(kCyclesPerRetrace));
+    CACTUS_GRAFICA("CPU: % del retrace emulado", 100.0 * double(budget - std::max<int64_t>(remaining, 0)) /
+                                                   double(budget));
     CACTUS_GRAFICA("CPU: despachos por retrace", double(dispatches));
     if (rt.trace && (++rt.frames % 60) == 0)
         std::fprintf(stderr, "[cpu] retrace %llu: PC %08x LR %08x MSR %08x TB %llu\n",

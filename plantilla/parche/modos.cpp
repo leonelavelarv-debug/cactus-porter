@@ -53,10 +53,12 @@ if (argc == 3 && strcmp(argv[1], "--probe") == 0) {  // cactus-porter: perfil de
       for (const FileEntry& f : parse_fst(fst)) {
         std::string lower = f.name;
         for (char& c : lower) c = char(tolower((unsigned char)c));
-        const bool compressed_name = lower.size() > 7 &&
-            (lower.rfind(".rel.lz") == lower.size() - 7 || lower.rfind(".rel.szs") == lower.size() - 8 ||
-             lower.rfind(".rel.yaz0") == lower.size() - 9);
-        const bool plain = lower.size() > 4 && lower.rfind(".rel") == lower.size() - 4;
+        const auto ends_with = [&lower](const char* suffix) {
+          const size_t n = strlen(suffix);
+          return lower.size() > n && lower.compare(lower.size() - n, n, suffix) == 0;
+        };
+        const bool compressed_name = ends_with(".rel.lz") || ends_with(".rel.szs") || ends_with(".rel.yaz0");
+        const bool plain = ends_with(".rel");
         if ((!plain && !compressed_name) || f.length == 0 || f.length > (64u << 20)) continue;
         std::vector<u8> raw(static_cast<size_t>(f.length)), rel;
         data->read(f.offset, raw.size(), raw.data());

@@ -10,6 +10,7 @@
 #include <string>
 #include <sys/stat.h>
 #include <vector>
+#include "ai_dma.h"
 #include "dev_di.h"
 #include "dev_fs.h"
 #include "dev_misc.h"
@@ -114,14 +115,16 @@ static void dsp_mem_written(uint32_t addr, size_t length) {
     galaxy::gx::notify_guest_memory_write(addr, uint32_t(length));
 }
 
-// DMA PCM del DSP. SDL recibe estéreo big-endian en bloques de 32 bytes.
-static struct {
-    uint32_t source, cursor, control, left, ai_control;
-} audio_dma;
+// DMA de audio (ai_dma.h): avanza con el tiempo emulado tras cada porción de CPU; lo producido se encola en
+// SDL una vez por cuadro (pump_audio).
+static ai::Dma audio_dma;
+static uint32_t g_ai_control = 0;
+static std::vector<uint8_t> g_audio_out;
 
 static void open_audio(uint32_t rate) {
     if (g_audio) SDL_CloseAudioDevice(g_audio);
     g_ai_rate = rate;
+    g_audio_out.clear();  // lo pendiente era de la frecuencia anterior
     SDL_AudioSpec want{};
     want.freq = int(rate);
     want.format = AUDIO_S16MSB;
@@ -132,31 +135,22 @@ static void open_audio(uint32_t rate) {
     else std::fprintf(stderr, "SDL audio: %s\n", SDL_GetError());
 }
 
+// Tras cada porción de CPU (cactus::set_slice_hook).
+static void audio_tick(int64_t cycles) {
+    if (audio_dma.tick(cycles, g_ai_rate, guest_span, g_audio_out))
+        dsp::raise_status(0x08);  // AIDINT: el juego programa el bloque siguiente
+}
+
 static void pump_audio() {
     CACTUS_ZONA("audio: DMA a SDL");
-    if (!g_audio || !(audio_dma.control & 0x8000) || !(audio_dma.control & 0x7fff)) return;
-    const uint32_t target = (g_ai_rate / 30) * 4;
-    uint32_t queued = SDL_GetQueuedAudioSize(g_audio);
+    if (!g_audio) { g_audio_out.clear(); return; }
+    const uint32_t queued = SDL_GetQueuedAudioSize(g_audio);
     // Lo que le queda a SDL por sonar: si llega a 0, el audio se corta (el juego no generó a tiempo).
     CACTUS_GRAFICA("audio en cola (ms)", g_ai_rate ? double(queued) / 4.0 * 1000.0 / g_ai_rate : 0.0);
-    bool finished = false;
-    while (queued < target) {
-        if (!audio_dma.left) {
-            audio_dma.left = audio_dma.control & 0x7fff;
-            audio_dma.cursor = audio_dma.source;
-        }
-        uint32_t blocks = std::min(audio_dma.left, (target - queued + 31) / 32);
-        uint32_t n = blocks * 32;
-        auto* src = guest_span(audio_dma.cursor, n);
-        if (!src || SDL_QueueAudio(g_audio, src, n) != 0) break;
-        audio_dma.cursor += n;
-        audio_dma.left -= blocks;
-        queued += n;
-        finished |= audio_dma.left == 0;
-    }
-    if (finished) {  // fin de bloque: el juego encola el siguiente en su interrupción AID
-        dsp::raise_status(0x08);  // AIDINT
-    }
+    // Más de 120 ms en cola: se descarta lo nuevo para que la latencia no crezca.
+    if (!g_audio_out.empty() && queued < g_ai_rate * 4u * 120u / 1000u)
+        SDL_QueueAudio(g_audio, g_audio_out.data(), uint32_t(g_audio_out.size()));
+    g_audio_out.clear();
 }
 
 // ---------------------------------------------------------------- MMIO
@@ -213,8 +207,8 @@ static uint64_t mmio_read(CPUState* cpu, uint32_t ea, uint8_t size) {
     case 0x5030: return audio_dma.source >> 16;
     case 0x5032: return audio_dma.source & 0xffff;
     case 0x5036: return audio_dma.control;
-    case 0x503a: return audio_dma.left ? audio_dma.left-1 : 0;
-    case 0x6c00: return audio_dma.ai_control;
+    case 0x503a: return audio_dma.blocks_left();
+    case 0x6c00: return g_ai_control;
     default: return 0;
     }
 }
@@ -271,18 +265,11 @@ static void mmio_write(CPUState* cpu, uint32_t ea, uint64_t value, uint8_t size)
     case 0x6018: di.length = v & ~31u; break;
     case 0x601c: di.control = v & 7u; if (di.control & 1u) di_transfer(); break;
     case 0x6020: di.immediate = v; break;
-    case 0x5030:
-        if (size == 4) audio_dma.source = v & 0x1fffffe0u;
-        else audio_dma.source = ((v & 0x1fff) << 16) | (audio_dma.source & 0xffff);
-        break;
-    case 0x5032: audio_dma.source = (audio_dma.source & 0xffff0000u) | (v & 0xffe0); break;
-    case 0x5036:
-        if (!(audio_dma.control & 0x8000) || !(v & 0x8000)) audio_dma.left = 0;
-        audio_dma.control = v & 0xffff;
-        if (!(v & 0x8000) && g_audio) SDL_ClearQueuedAudio(g_audio);
-        break;
+    case 0x5030: audio_dma.write_source_high(uint16_t(v)); break;  // los de 32 bits llegan ya partidos
+    case 0x5032: audio_dma.write_source_low(uint16_t(v)); break;
+    case 0x5036: audio_dma.write_control(uint16_t(v)); break;
     case 0x6c00: {
-        audio_dma.ai_control = v;
+        g_ai_control = v;
         uint32_t rate = (v & 0x40) ? 32000 : 48000;
         if (rate != g_ai_rate) open_audio(rate);
         break;
@@ -416,6 +403,7 @@ int main(int argc, char** argv) {
   auto fs = ios::make_dev_fs(nand_path);
   if (!fs) { perror(nand_path); return 1; }
   ios::kernel().init(&g_cpu, ipc_irq);
+  ios::kernel().set_written_hook([](uint32_t addr, uint32_t len) { galaxy::gx::notify_guest_memory_write(addr, len); });
   ios::kernel().register_device("/dev/fs", fs);
   ios::kernel().register_device("/dev/di", std::make_shared<ios::DevDI>(g_pak));
   ios::register_misc_devices(ios::kernel(), boot.title_id);
@@ -429,8 +417,9 @@ int main(int argc, char** argv) {
     cpu_free(&g_cpu);
     return 1;
   }
-  audio_dma.ai_control = 0x40;
+  g_ai_control = 0x40;
   open_audio(g_ai_rate);
+  cactus::set_slice_hook(audio_tick);
   if (!cactus::gx_init(&g_cpu, 640, 480)) {
     if (g_audio) SDL_CloseAudioDevice(g_audio);
     SDL_Quit();
@@ -442,6 +431,7 @@ int main(int argc, char** argv) {
     galaxy::gx::notify_guest_memory_write(0x80000000u + offset, size);
   }, nullptr);
   bool ok = cactus::game_init(&g_cpu, entry);
+  cactus::set_retrace_hz(boot.pal ? 50 : 60);
 
   const double freq = double(SDL_GetPerformanceFrequency());
   const double period = boot.pal ? 1.0 / 50.0 : 1.0 / 60.0;

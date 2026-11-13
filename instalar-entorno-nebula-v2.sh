@@ -40,7 +40,7 @@ checkout() {
     [[ -d "$dest/.git" ]] || { echo "Comprueba el directorio existente: $dest" >&2; return 1; }
     if git -C "$dest" rev-parse --verify HEAD >/dev/null 2>&1; then
         [[ "$(git -C "$dest" rev-parse HEAD)" == "$rev" ]] || {
-            echo "Ya existe otra revisión en $dest. Se conserva tu copia." >&2; return 1;
+            echo "Ya existe otra revisión en $dest. Se conserva tu copia." >&2; return 0;
         }
     else
         git -C "$dest" fetch --depth 1 "https://github.com/$repo.git" "$rev"

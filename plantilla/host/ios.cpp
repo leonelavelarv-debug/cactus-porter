@@ -84,7 +84,10 @@ s32 Kernel::do_ioctlv(s32 fd, u32 req, u32 nin, u32 nout, u32 address) {
             if (!v.data) return IPC_EINVAL;
         }
     }
-    return s->dev->ioctlv(s->handle, req, nin, nout, vectors.data());
+    const s32 result = s->dev->ioctlv(s->handle, req, nin, nout, vectors.data());
+    if (result != IPC_NO_REPLY)
+        for (u32 i = nin; i < count; ++i) written(be32(table + 8 * i), vectors[i].len);
+    return result;
 }
 
 void Kernel::process(u32 address) {
@@ -122,6 +125,7 @@ void Kernel::process(u32 address) {
             if (data || !arg(1))
                 result = cmd == IOS_READ ? s->dev->read(s->handle, data, arg(1))
                                         : s->dev->write(s->handle, data, arg(1));
+            if (cmd == IOS_READ && result > 0) written(arg(0), u32(result));
             break;
         }
         case IOS_SEEK:
@@ -132,6 +136,7 @@ void Kernel::process(u32 address) {
             u8* out = arg(4) ? guest_ptr(arg(3), arg(4)) : nullptr;
             if ((!arg(2) || in) && (!arg(4) || out))
                 result = s->dev->ioctl(s->handle, arg(0), in, arg(2), out, arg(4));
+            if (out && result != IPC_NO_REPLY) written(arg(3), arg(4));
             break;
         }
         case IOS_IOCTLV:

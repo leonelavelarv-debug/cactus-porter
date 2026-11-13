@@ -41,6 +41,9 @@ class Kernel {
     // Un juego pidió apagar o volver al menú (STM).
     bool shutdown_requested() const { return shutdown_; }
     void request_shutdown() { shutdown_ = true; }
+    // Aviso de que IOS escribió en memoria del juego (lecturas de disco o NAND): el renderer descarta lo que
+    // tuviera de esa zona (texturas). Recibe la dirección virtual (0x8.../0x9...).
+    void set_written_hook(void (*hook)(u32 addr, u32 len)) { written_ = hook; }
 
  private:
     struct Slot { std::shared_ptr<Device> dev; s32 handle = -1; };
@@ -52,7 +55,9 @@ class Kernel {
 
     u32 accepted_ = 0, irq_flags_ = 0, irq_mask_ = 0, current_ = 0;
     bool shutdown_ = false;
+    void (*written_)(u32, u32) = nullptr;
     std::deque<std::pair<u32, s32>> replies_;
+    void written(u32 addr, u32 len) { if (written_ && len) written_(addr | 0x80000000u, len); }
     void update_irq();
     void deliver();
     u8* guest_ptr(u32 addr, u32 len);

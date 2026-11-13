@@ -78,7 +78,10 @@ def cmd_fetch(_):
         branch = (["--branch", "rg35xxh-arm64"] if nombre == "cactus-galaxy" else
                   ["--branch", TRACY_VERSION] if nombre == "tracy" else [])
         if not dst.exists():
-            run(["git", "clone", "--depth", "1", *branch, url, dst])
+            # Tracy es opcional (build --tracy y perf): si no se puede clonar, se avisa y se sigue.
+            if run(["git", "clone", "--depth", "1", *branch, url, dst], check=(nombre != "tracy")).returncode != 0:
+                print(f"Aviso: no se pudo clonar {url}; build --tracy y perf no estarán disponibles.")
+                continue
         if nombre == "DolRecomp":
             run(["git", "submodule", "update", "--init", "--recursive"], cwd=dst)
         elif nombre == "tracy":
@@ -352,7 +355,7 @@ def cmd_package(args):
     titulo_fs = re.sub(r'[\\/:*?"<>|]+', " -", perfil["nombre"]).strip(" .") or slug
     sh = puerto / f"{titulo_fs}.sh"; sh.write_text(lanzador); sh.chmod(0o755)
     port_json = {
-        "version": 4, "name": f"{slug}.zip",
+        "version": 4, "name": f"{slug}-tracy.zip" if con_tracy else f"{slug}.zip",
         "items": [sh.name, f"{slug}/"], "items_opt": None,
         "attr": {"title": perfil["nombre"], "porter": ["cactus-porter"],
                  "desc": f"Port nativo de {perfil['nombre']} (Wii, {gid}) recompilado con DolRecomp sobre cactus-galaxy/Nebula (GLES 3.2).",
@@ -450,7 +453,7 @@ def cmd_perf(args):
     if not args.traza and not args.ip:
         sys.exit("!! falta --ip (la IP de la consola, en KNULLI: Ajustes de red) o --traza <archivo.tracy>")
     h = herramientas_tracy()
-    d = (dir_juego(args.juego) if args.juego else TRABAJO / "perfiles") / "perfiles"
+    d = (dir_juego(args.juego) if args.juego else TRABAJO) / "perfiles"
     d.mkdir(parents=True, exist_ok=True)
     traza = Path(args.traza) if args.traza else d / time.strftime("%Y%m%d-%H%M%S.tracy")
     if not args.traza:

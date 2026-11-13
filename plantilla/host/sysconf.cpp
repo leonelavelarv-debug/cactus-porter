@@ -1,6 +1,7 @@
 #include "sysconf.h"
 #include "wiimote.h"
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <sys/stat.h>
 
@@ -28,8 +29,9 @@ Item dinf() {
 
 Item cdif() { return {"BT.CDIF", BigArray, std::vector<uint8_t>(0x205, 0)}; }
 
-std::vector<Item> items() {
-    return {byte("IPL.LNG", 1), byte("IPL.AR", 0), boolean("IPL.E60", true), boolean("IPL.PGS", true),
+// IPL.E60 apagado: los juegos PAL se quedan en 50 Hz, el ritmo con el que el host los emula.
+std::vector<Item> items(uint8_t language) {
+    return {byte("IPL.LNG", language), byte("IPL.AR", 0), boolean("IPL.E60", false), boolean("IPL.PGS", true),
             byte("IPL.SND", 1), boolean("IPL.EULA", true), word32("IPL.CB", 0), word32("IPL.IDL", 0),
             byte("BT.BAR", 1), byte("BT.MOT", 1), byte("BT.SPKV", 0x58), word32("BT.SENS", 3),
             cdif(), dinf()};
@@ -39,8 +41,17 @@ void put16(std::vector<uint8_t>& b, size_t at, uint16_t v) { b[at] = uint8_t(v >
 
 }  // namespace
 
-std::vector<uint8_t> build() {
-    const std::vector<Item> list = items();
+uint8_t language_from_env() {
+    const char* l = std::getenv("CACTUS_LANG");
+    if (!l) return 1;
+    static const struct { const char* code; uint8_t value; } kLang[] = {
+        {"ja", 0}, {"en", 1}, {"de", 2}, {"fr", 3}, {"es", 4}, {"it", 5}, {"nl", 6}, {"zh", 7}, {"ko", 9}};
+    for (const auto& e : kLang) if (std::strncmp(l, e.code, 2) == 0) return e.value;
+    return 1;
+}
+
+std::vector<uint8_t> build(uint8_t language) {
+    const std::vector<Item> list = items(language);
     std::vector<uint8_t> f(kSize, 0);
     std::memcpy(&f[0], "SCv0", 4);
     put16(f, 4, uint16_t(list.size()));
@@ -64,7 +75,7 @@ bool ensure(const std::string& nand_dir) {
     const std::string path = nand_dir + "/shared2/sys/SYSCONF";
     struct stat st;
     if (stat(path.c_str(), &st) == 0 && st.st_size == long(kSize)) return true;
-    const std::vector<uint8_t> f = build();
+    const std::vector<uint8_t> f = build(language_from_env());
     FILE* out = std::fopen(path.c_str(), "wb");
     if (!out) return false;
     const bool ok = std::fwrite(f.data(), 1, f.size(), out) == f.size();
