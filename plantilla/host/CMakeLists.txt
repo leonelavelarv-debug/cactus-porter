@@ -60,14 +60,23 @@ endforeach()
 
 # El renderer exporta una cabecera de compatibilidad de C++ por -include.
 # Las unidades C de DolRecomp se compilan con sus propias opciones.
+# Módulos REL recompilados (cactus-porter recomp los deja en cactus_rels.cmake); sin REL, tabla vacía.
+if(EXISTS "${GENERATED_DIR}/cactus_rels.cmake")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${GENERATED_DIR}/cactus_rels.cmake")
+    include("${GENERATED_DIR}/cactus_rels.cmake")
+else()
+    set(CACTUS_REL_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/rel_vacio.c")
+endif()
+
 add_library(cactus_game_cpu OBJECT
     "${DOLRECOMP_DIR}/src/cpu/cpu.c"
-    ${GEN_SOURCES})
+    ${GEN_SOURCES}
+    ${CACTUS_REL_SOURCES})
 target_include_directories(cactus_game_cpu PRIVATE "${GENERATED_DIR}" "${DOLRECOMP_DIR}/src")
 target_compile_options(cactus_game_cpu PRIVATE -O2 -Wall)
 
 add_executable(${CACTUS_SLUG}-host
-    wii_host.cpp wii_boot.cpp dsp_hle.cpp zelda_hle.cpp wiimote.cpp dev_bt.cpp sysconf.cpp ios.cpp dev_di.cpp dev_fs.cpp dev_misc.cpp wii_dvd.cpp gx_bridge.cpp juego_glue.cpp
+    wii_host.cpp wii_boot.cpp dsp_hle.cpp ax_hle.cpp zelda_hle.cpp wii_rel.cpp wiimote.cpp dev_bt.cpp sysconf.cpp ios.cpp dev_di.cpp dev_fs.cpp dev_misc.cpp wii_dvd.cpp gx_bridge.cpp juego_glue.cpp
     "${CACTUS_GALAXY_ROOT}/platform/knulli/game/host_window_knulli.cpp"
     "${CACTUS_GALAXY_ROOT}/platform/sdl/display_clock.cpp"
     $<TARGET_OBJECTS:cactus_game_cpu>)

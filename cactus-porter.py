@@ -122,6 +122,8 @@ def parchear_nebula_pak(src: str, perfil: dict, modos_cpp: str) -> str:
     ancla = '  if (argc != 3) {\n    fprintf(stderr, "uso: nebula-pak'
     uno(ancla, modos_cpp + ancla, "modos")
     src = src.replace("Super Mario Galaxy", nombre).replace("RMGE01", gid).replace("norteamericano", region)
+    # Descompresores de los REL (--dump-rels), compartidos con el host.
+    src = '#include <cctype>\n#include "cactus_comprimidos.h"\n' + src
     return src
 
 def dir_juego(gid): return TRABAJO / gid
@@ -151,6 +153,14 @@ def cmd_probe(args):
               "slug": re.sub(r"[^a-z0-9]+", "-", nombre.lower()).strip("-") or gid.lower()}
     dj = dir_juego(gid); dj.mkdir(parents=True, exist_ok=True)
     run([exe, "--dump-dol", iso, dj / "main.dol"])
+    # Módulos REL (sueltos o en Yaz0/LZ77), descomprimidos para DolRecomp. El host los vuelve a leer del
+    # game.pak en la consola: el paquete no lleva datos del juego.
+    rels = dj / "rels"
+    shutil.rmtree(rels, ignore_errors=True); rels.mkdir()
+    lista = run([exe, "--dump-rels", iso, rels], capture=True).stdout
+    perfil["rels"] = dict(reversed(l.split("\t", 1)) for l in lista.splitlines() if "\t" in l)
+    if perfil["rels"]:
+        print(f"{len(perfil['rels'])} módulos REL: se recompilan junto al DOL (recomp).")
     (dj / "perfil.json").write_text(json.dumps(perfil, indent=2, ensure_ascii=False))
     print(f"\nPerfil de {nombre} ({gid}): SHA-1 {sha[:12]}…, partición {int(pb)>>20} MiB")
     print(f"Guardado en {dj/'perfil.json'}; main.dol listo para DolRecomp.")
@@ -165,13 +175,77 @@ def cmd_recomp(args):
     run(["cmake", "--build", b, "--target", "dolrecomp", "--config", "Release", "-j", str(os.cpu_count() or 4)])
     exe = b / "dolrecomp"
     cmd = [exe, f"-j{os.cpu_count() or 4}", "--cpu", "broadway"]
+    base = list(cmd)
     if args.map:    cmd += ["--map", args.map]
     if args.config: cmd += ["--config", args.config]
     gid = perfil["id"]
     gen = dj / "recomp" / f"{gid}_generated"
     gen.mkdir(parents=True, exist_ok=True)
     run(cmd + [dj / "main.dol", gid, gen / f"{gid}.c"])
+    recomp_rels(exe, base, perfil, dj, gen)
     print(f"C generado en {gen}")
+
+# ---------------------------------------------------------------- REL
+REL_BASE, REL_FIN = 0x81800000, 0x82000000   # hueco sobre MEM1 a menos de 32 MiB del DOL (wii_rel.h)
+
+def recomp_rels(exe, cmd, perfil, dj, gen):
+    """Recompila los REL del perfil (todos juntos, para resolver sus importaciones) y genera la tabla del host."""
+    rels = perfil.get("rels") or {}
+    for viejo in gen.glob("cactus_rel*"): viejo.unlink()
+    if not rels:
+        return
+    out = dj / "recomp" / "rels"
+    shutil.rmtree(out, ignore_errors=True); out.mkdir(parents=True)
+    salida = run(cmd + ["--rel-base", hex(REL_BASE), dj / "rels", perfil["id"], out], capture=True).stdout
+    modulos = leer_modulos(salida, dj / "rels", rels)
+    if len(modulos) != len(rels):
+        sys.exit(f"!! DolRecomp informó {len(modulos)} módulos REL de {len(rels)}")
+    generar_tabla_rels(gen, out, modulos)
+
+def leer_modulos(salida, dir_rels, rels):
+    """Módulos que DolRecomp asignó en modo carpeta ('module N: ruta -> base 0x...'), con su ruta en el disco."""
+    modulos = []
+    for m in re.finditer(r"module (\d+): (.+?) -> base 0x([0-9A-Fa-f]{8})", salida):
+        ruta = Path(m.group(2)).resolve().relative_to(Path(dir_rels).resolve()).as_posix()
+        modulos.append({"id": int(m.group(1)), "base": int(m.group(3), 16), "rel": ruta,
+                        "disco": rels.get(ruta, ruta)})
+    return modulos
+
+def generar_tabla_rels(gen, out, modulos):
+    """cactus_rels.c (tabla id/base/ruta/búsqueda), un pegamento por módulo y cactus_rels.cmake con las fuentes."""
+    fuentes, decl, filas = [], [], []
+    for m in sorted(modulos, key=lambda m: m["base"]):
+        tope = m["base"]
+        nombre = f"{Path(m['rel']).stem}_{m['id']}"
+        dirs = [d for d in out.rglob(nombre) if (d / "generated.c").is_file()]
+        if len(dirs) != 1: sys.exit(f"!! no encuentro el C generado del módulo {m['id']} ({nombre})")
+        d = dirs[0].resolve()
+        fuentes.append(d / "generated.c")
+        for linea in (d / "generated.c").read_text().splitlines():
+            if re.match(r"^// chunks/[^ ]+\.c$", linea): fuentes.append(d / linea[3:])
+        pegamento = gen / f"cactus_rel_{m['id']}.c"
+        pegamento.write_text(f'#include "{d / "generated.h"}"\n'
+                             f"DolRecompFunction cactus_rel_find_{m['id']}(u32 address) "
+                             "{ return dolrecomp_find_original(address); }\n")
+        fuentes.append(pegamento.resolve())
+        decl.append(f"CactusRelFunction cactus_rel_find_{m['id']}(uint32_t);")
+        disco = m["disco"].replace("\\", "\\\\").replace('"', '\\"')
+        filas.append(f'    {{{m["id"]}u, 0x{m["base"]:08X}u, "{disco}", cactus_rel_find_{m["id"]}}},')
+        if not (REL_BASE <= tope < REL_FIN):
+            sys.exit(f"!! el módulo {m['id']} quedó en 0x{tope:08X}, fuera de 0x{REL_BASE:08X}-0x{REL_FIN:08X}")
+    tabla = gen / "cactus_rels.c"
+    tabla.write_text("// Generado por cactus-porter: módulos REL recompilados (wii_rel.h).\n"
+                     "#include <stdint.h>\ntypedef struct CPUState CPUState;\n"
+                     "typedef void (*CactusRelFunction)(CPUState*);\n"
+                     "typedef struct { uint32_t id, base; const char* disc_path; "
+                     "CactusRelFunction (*find)(uint32_t); } CactusRelModule;\n" +
+                     "\n".join(decl) + "\nconst CactusRelModule cactus_rel_modules[] = {\n" + "\n".join(filas) +
+                     f"\n}};\nconst unsigned cactus_rel_module_count = {len(filas)};\n")
+    fuentes.append(tabla.resolve())
+    (gen / "cactus_rels.cmake").write_text(
+        "# Generado por cactus-porter: C de los REL recompilados.\nset(CACTUS_REL_SOURCES\n" +
+        "".join(f'    "{f.as_posix()}"\n' for f in fuentes) + ")\n")
+    print(f"{len(modulos)} módulos REL recompilados entre 0x{REL_BASE:08X} y 0x{REL_FIN:08X}.")
 
 # ---------------------------------------------------------------- build
 def fuente_original(path):
@@ -192,6 +266,7 @@ def preparar_pak(perfil, dj):
     pak = Path("platform/knulli/pak/nebula_pak.cpp")
     modos = (PLANTILLA / "parche/modos.cpp").read_text()
     (root / pak).write_text(parchear_nebula_pak(fuente_original(fork()/pak), perfil, modos))
+    shutil.copy2(PLANTILLA / "host/cactus_comprimidos.h", (root / pak).parent / "cactus_comprimidos.h")
     wrapper = Path("platform/knulli/cactus/cactus_wrapper.cpp")
     (root / wrapper).write_text(fuente_original(fork()/wrapper).replace("Super Mario Galaxy", perfil["nombre"]))
     return (root / pak).parent

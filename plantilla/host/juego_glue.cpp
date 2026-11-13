@@ -5,8 +5,10 @@
 //    instruction_fallback; sin él, cada uno es una excepción de programa y el juego muere en __start.
 //  - Las excepciones saltan a 0x500, 0x800, 0x900... Ahí el OS de Revolution copia en tiempo de ejecución su
 //    __OSExceptionVector, que no está recompilado. host_call lo ejecuta en C (mismo efecto que el stub).
+//  - Los saltos a código de módulos REL (en el heap del juego o en su dirección recompilada) van a wii_rel.cpp.
 // Cada retrace concede un presupuesto de ciclos de Broadway y un tope de tiempo real.
 #include "wii_gx.h"
+#include "wii_rel.h"
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -202,6 +204,7 @@ bool os_vector(CPUState* cpu, uint32_t vector) {
 }
 
 bool host_call(CPUState* cpu, uint32_t address) {
+    if (rel::dispatch(cpu, address)) return true;  // código de un módulo REL
     const uint32_t segment = address >> 28, vector = address & 0x0FFFFFFFu;  // 0x00000500, 0x80000500, 0xC0000500
     if ((segment != 0 && segment != 8 && segment != 0xC) || vector < 0x100 || vector >= 0x3000 || (vector & 0xFF))
         return false;

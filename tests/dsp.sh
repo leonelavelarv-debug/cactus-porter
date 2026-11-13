@@ -77,7 +77,7 @@ int main() {
     send(0xCDD10000);
     assert(line && recv() == 0xDCD10001);
     clear_dspint();
-    mem[0x2000] = 0x00; mem[0x2001] = 0x0F;            // CMD_END
+    mem[0x2000] = 0x00; mem[0x2001] = 0x0E;            // CMD_END (AX de Wii)
     send(0xBABE0004); assert(!pending());              // primero el tamaño...
     send(0x00002000);                                  // ...y luego la dirección
     assert(pending() && recv() == 0xDCD10002 && dsp::frames_processed() == 1);
@@ -152,5 +152,5 @@ int main() {
     return 0;
 }
 CPP
-g++ -std=c++20 -Wall -Wextra -Werror -I"$host" harness.cpp "$host/dsp_hle.cpp" "$host/zelda_hle.cpp" -o harness
+g++ -std=c++20 -Wall -Wextra -Werror -I"$host" harness.cpp "$host/dsp_hle.cpp" "$host/ax_hle.cpp" "$host/zelda_hle.cpp" -o harness
 ./harness

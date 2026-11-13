@@ -56,6 +56,6 @@ int main() {
 }
 CPP
 c++ -std=c++20 -O2 -DCACTUS_GENERATED_HEADER='"TEST01.h"' -I. -I"$host" \
-    -I"$dr/src" "$host/juego_glue.cpp" harness.cpp ./*.o -lm -o check
+    -I"$dr/src" "$host/juego_glue.cpp" "$host/wii_rel.cpp" -x c "$host/rel_vacio.c" -x none harness.cpp ./*.o -lm -o check
 ./check
 echo "OK: despacho, máscaras, vector externo, rfi y continuación"

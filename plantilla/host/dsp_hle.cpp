@@ -16,10 +16,11 @@
 //  * Los buzones son de un solo correo: el DSP no manda el siguiente hasta que la CPU lee el bajo (0x5006).
 //    Aquí se encolan. Los correos con interrupción levantan DSPINT cuando llegan al frente.
 //
-// Microcódigos con otros protocolos (tarjeta, GBA, ASnd...) se tratan como AX: con CACTUS_TRACE_DSP=1 se ven
-// sus correos y su hash.
+// Microcódigos con otros protocolos (tarjeta, GBA, ASnd...) se tratan como AX de Wii (ax_hle.cpp), como hace
+// Dolphin: con CACTUS_TRACE_DSP=1 se ven sus correos y su hash.
 #include "dsp_hle.h"
 #include "zelda_hle.h"
+#include "ax_hle.h"
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -59,6 +60,7 @@ struct State {
     bool want_list = false;
     uint32_t list_size = 0;
     uint32_t frames = 0;
+    std::unique_ptr<ax::Wii> ax;
     // Zelda
     std::unique_ptr<zelda::Ucode> zelda;
     // Cambio de microcódigo (0xCDD10001 y diez correos) y el microcódigo guardado para volver a él.
@@ -66,7 +68,13 @@ struct State {
     uint32_t upload[10] = {};
     unsigned upload_n = 0;
     uint32_t hash = 0;
-    struct Saved { bool valid = false; Ucode kind = Ucode::None; uint32_t hash = 0; std::unique_ptr<zelda::Ucode> zelda; } saved;
+    struct Saved {
+        bool valid = false;
+        Ucode kind = Ucode::None;
+        uint32_t hash = 0;
+        std::unique_ptr<zelda::Ucode> zelda;
+        std::unique_ptr<ax::Wii> ax;
+    } saved;
     // ARAM
     uint32_t ar_mm = 0, ar_ar = 0, ar_cnt = 0;
     std::vector<uint8_t> aram;
@@ -115,6 +123,7 @@ void start_rom() {
     TRACE("reinicio: ROM");
     s.ucode = Ucode::Rom;
     s.zelda.reset();
+    s.ax.reset();
     s.rom_tag = s.rom_ram = s.rom_len = 0;
     s.want_list = s.uploading = false;
     flush_mail();
@@ -140,6 +149,8 @@ uint8_t* zelda_aram(uint32_t off, size_t len) {
 void zelda_push(uint32_t mail, bool irq) { push(mail, irq); }
 void zelda_dspint() { s.cr |= CR_DSPINT; update_irq(); }
 const zelda::Env kZeldaEnv{zelda_span, zelda_written, zelda_aram, zelda_push, zelda_dspint};
+void ax_written(uint32_t addr, size_t len) { if (s.host.mem_written) s.host.mem_written(addr, len); }
+const ax::Env kAxEnv{zelda_span, ax_written, zelda_push};
 
 uint32_t image_hash(uint32_t image, uint32_t length) {
     if (!length || length > 0x10000 || !s.host.span) return 0;
@@ -152,6 +163,7 @@ void boot_fresh(uint32_t hash) {
     s.hash = hash;
     s.want_list = s.uploading = false;
     s.zelda.reset();
+    s.ax.reset();
     flush_mail();
     if (zelda::known(hash)) {
         TRACE("microcódigo %08X: Zelda", hash);
@@ -159,8 +171,9 @@ void boot_fresh(uint32_t hash) {
         s.zelda = std::make_unique<zelda::Ucode>(kZeldaEnv, hash);
         s.zelda->initialize();
     } else {
-        TRACE("microcódigo %08X: se trata como AX", hash);
+        TRACE("microcódigo %08X: se trata como AX de Wii", hash);
         s.ucode = Ucode::Ax;
+        s.ax = std::make_unique<ax::Wii>(kAxEnv, hash);
         push(DSP_INIT, true);
     }
 }
@@ -182,6 +195,7 @@ void swap_ucode() {
         s.ucode = s.saved.kind;
         s.hash = hash;
         s.zelda = std::move(s.saved.zelda);
+        s.ax = std::move(s.saved.ax);
         s.saved = {};
         s.want_list = false;
         push(DSP_RESUME, true);  // el microcódigo recuperado sigue donde lo dejó
@@ -192,6 +206,7 @@ void swap_ucode() {
         s.saved.kind = s.ucode;
         s.saved.hash = s.hash;
         s.saved.zelda = std::move(s.zelda);
+        s.saved.ax = std::move(s.ax);
     }
     boot_fresh(hash);
 }
@@ -213,15 +228,11 @@ void rom_mail(uint32_t m) {
 }
 
 // ---------------------------------------------------------------- AX
-// Aquí se mezclaría el audio. La lista (AX: CMD_SETUP 0x00, PBADDR 0x02, PROCESS 0x03, MIX_AUX* 0x04-0x06,
-// OUTPUT 0x0E, END 0x0F) recorre la cadena de PBs de las voces y deja L/R en el búfer del DMA de audio.
-// Por ahora solo se cuenta: el búfer de salida del juego queda como lo dejó (cero tras AXInit) y suena silencio.
+// ax_hle.cpp recorre la lista: voces, AUX y la salida estéreo al búfer del DMA de audio (con DSP_SYNC).
 void ax_list(uint32_t addr, uint32_t size) {
     ++s.frames;
-    if (s.trace && s.host.span) {
-        if (const uint8_t* p = s.host.span(addr, 4))
-            TRACE("lista AX #%u en %08X (tamaño %u), primer comando %02X%02X", s.frames, addr, size, p[0], p[1]);
-    }
+    TRACE("lista AX #%u en %08X (tamaño %u)", s.frames, addr, size);
+    if (s.ax) s.ax->command_list(addr, uint16_t(size));
 }
 
 void begin_upload() { s.uploading = true; s.upload_n = 0; }

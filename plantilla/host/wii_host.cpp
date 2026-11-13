@@ -1,6 +1,7 @@
 // wii_host.cpp — host del port: CPUState de DolRecomp + MMIO de Wii sobre SDL2.
 // El renderer GLES de Nebula dibuja (gx_bridge.cpp); el CPU corre en juego_glue.cpp.
 #include <SDL.h>
+#include <cstdlib>
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
@@ -17,6 +18,7 @@
 #include "sdl_host.h"
 #include "dev_bt.h"
 #include "sysconf.h"
+#include "wii_rel.h"
 #include "galaxy/input_bindings.h"
 #include "wii_boot.h"
 #include "wii_dvd.h"
@@ -352,6 +354,13 @@ int main(int argc, char** argv) {
 
   if (!cpu_init(&g_cpu)) return 1;
   if (!cpu_alloc_mem2(&g_cpu, WII_MEM2_SIZE)) return 1;   // MEM1 24 MiB + MEM2 64 MiB
+  // MEM1 del host de 32 MiB: los 8 MiB de arriba (0x81800000-0x82000000) son de los REL recompilados
+  // (wii_rel.h). El juego no los ve: el arranque le dice que MEM1 mide 24 MiB.
+  if (void* ram = std::calloc(1, rel::kRegionEnd - 0x80000000u)) {
+    std::free(g_cpu.ram);
+    g_cpu.ram = static_cast<uint8_t*>(ram);
+    g_cpu.ram_size = rel::kRegionEnd - 0x80000000u;
+  }
   g_cpu.external_read32 = [](CPUState* cpu, uint32_t ea, uint8_t) -> uint32_t {
     return uint32_t(mmio_read(cpu, ea, 4));
   };
@@ -374,6 +383,16 @@ int main(int argc, char** argv) {
     memcpy(dst, dol.data() + off, n);
   }
   const uint32_t entry = be32(dol.data() + 0xE0);
+  {
+    std::vector<rel::Range> code;
+    for (int i = 0; i < 7; ++i) {  // secciones de texto
+      const uint32_t addr = be32(dol.data() + 0x48 + 4*i), n = be32(dol.data() + 0x90 + 4*i);
+      if (n) code.push_back({addr, addr + n});
+    }
+    rel::init(&g_cpu, cactus_rel_modules, cactus_rel_module_count,
+              [](const std::string& path, std::vector<uint8_t>& out) { return g_pak.read_file(path, out); },
+              std::move(code));
+  }
 
   // Lo que el IPL, IOS y el apploader dejan en RAM antes de main.dol.
   wii::BootInfo boot;

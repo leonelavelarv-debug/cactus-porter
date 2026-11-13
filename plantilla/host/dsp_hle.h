@@ -2,8 +2,8 @@
 // protocolo de AX (listas de comandos) y DMA de ARAM. No depende de SDL: se prueba en PC.
 //
 // Alcance: el DSP "contesta" al instante y con el protocolo correcto, así que el SDK (DSPInit/AXInit) termina
-// su arranque y el juego sigue. El microcódigo Zelda (Mario Galaxy 1/2, Zelda TP...) sí mezcla audio
-// (zelda_hle.cpp, portado de Dolphin). AX NO mezcla todavía: sus listas de comandos se aceptan y se descartan.
+// su arranque y el juego sigue. Los dos microcódigos de audio mezclan de verdad, portados de Dolphin: AX de Wii
+// (ax_hle.cpp, casi todo el catálogo) y Zelda (zelda_hle.cpp: Mario Galaxy 1/2, Zelda TP...).
 #pragma once
 #include <cstddef>
 #include <cstdint>
@@ -32,6 +32,6 @@ void raise_status(uint16_t bits);
 
 Ucode current_ucode();
 uint32_t ucode_hash();         // hash "Ector" (el de Dolphin) del microcódigo en marcha (0 si ninguno)
-uint32_t frames_processed();   // listas de comandos AX aceptadas + cuadros que mezcló Zelda
+uint32_t frames_processed();   // listas de comandos AX ejecutadas + cuadros que mezcló Zelda
 
 }  // namespace dsp

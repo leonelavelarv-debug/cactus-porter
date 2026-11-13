@@ -193,5 +193,5 @@ int main() {
     return 0;
 }
 CPP
-g++ -std=c++20 -Wall -Wextra -Werror -I"$host" harness.cpp "$host/dsp_hle.cpp" "$host/zelda_hle.cpp" -o harness
+g++ -std=c++20 -Wall -Wextra -Werror -I"$host" harness.cpp "$host/dsp_hle.cpp" "$host/ax_hle.cpp" "$host/zelda_hle.cpp" -o harness
 ./harness
