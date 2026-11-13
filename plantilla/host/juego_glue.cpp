@@ -9,6 +9,7 @@
 // Cada retrace concede un presupuesto de ciclos de Broadway y un tope de tiempo real.
 #include "wii_gx.h"
 #include "wii_rel.h"
+#include "perfil.h"
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -246,14 +247,17 @@ bool game_init(CPUState* cpu, uint32_t entry) {
     cpu->msr = kMsrFP | kMsrIR | kMsrDR | kMsrRI;
     cpu->gpr[1] = 0x816FFFF0u;
     cpu->pc = entry;
+    CACTUS_GRAFICA_PORCENTAJE("CPU: % del retrace emulado");
     std::fprintf(stderr, "Inicio del DOL en %08x\n", entry);
     return true;
 }
 
 bool game_frame(CPUState* cpu, const uint32_t& pi_mask) {
+    CACTUS_ZONA("CPU: código recompilado");
     using clock = std::chrono::steady_clock;
     const auto deadline = clock::now() + std::chrono::milliseconds(rt.slice_ms);
     int64_t remaining = kCyclesPerRetrace;
+    uint32_t dispatches = 0;
     for (uint32_t n = 1; remaining > 0; ++n) {
         if (cpu->msr & kMsrEE) {
             if (gx_pi_cause_exchange(0) & pi_mask) {
@@ -286,8 +290,18 @@ bool game_frame(CPUState* cpu, const uint32_t& pi_mask) {
             cpu->exception = 0;
             cpu->program_exception = 0;
         }
-        if ((n & 63) == 0 && clock::now() >= deadline) break;
+        if ((n & 63) == 0 && clock::now() >= deadline) {
+            CACTUS_MENSAJE("CPU: tope de %d ms alcanzado", rt.slice_ms);
+            dispatches = n;
+            break;
+        }
+        dispatches = n;
     }
+    // La métrica principal: cuánto de un retrace de Broadway se emuló dentro del tope de tiempo. Por debajo
+    // de 100 %, el juego va más lento que en la Wii.
+    CACTUS_GRAFICA("CPU: % del retrace emulado", 100.0 * double(kCyclesPerRetrace - std::max<int64_t>(remaining, 0)) /
+                                                   double(kCyclesPerRetrace));
+    CACTUS_GRAFICA("CPU: despachos por retrace", double(dispatches));
     if (rt.trace && (++rt.frames % 60) == 0)
         std::fprintf(stderr, "[cpu] retrace %llu: PC %08x LR %08x MSR %08x TB %llu\n",
                      (unsigned long long)rt.frames, cpu->pc, cpu->lr, cpu->msr,

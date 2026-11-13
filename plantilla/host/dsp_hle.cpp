@@ -21,6 +21,7 @@
 #include "dsp_hle.h"
 #include "zelda_hle.h"
 #include "ax_hle.h"
+#include "perfil.h"
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -167,11 +168,13 @@ void boot_fresh(uint32_t hash) {
     flush_mail();
     if (zelda::known(hash)) {
         TRACE("microcódigo %08X: Zelda", hash);
+        CACTUS_MENSAJE("DSP: microcódigo %08X (Zelda)", hash);
         s.ucode = Ucode::Zelda;
         s.zelda = std::make_unique<zelda::Ucode>(kZeldaEnv, hash);
         s.zelda->initialize();
     } else {
         TRACE("microcódigo %08X: se trata como AX de Wii", hash);
+        CACTUS_MENSAJE("DSP: microcódigo %08X (AX de Wii)", hash);
         s.ucode = Ucode::Ax;
         s.ax = std::make_unique<ax::Wii>(kAxEnv, hash);
         push(DSP_INIT, true);
@@ -230,9 +233,13 @@ void rom_mail(uint32_t m) {
 // ---------------------------------------------------------------- AX
 // ax_hle.cpp recorre la lista: voces, AUX y la salida estéreo al búfer del DMA de audio (con DSP_SYNC).
 void ax_list(uint32_t addr, uint32_t size) {
+    CACTUS_ZONA("DSP: lista AX");
     ++s.frames;
     TRACE("lista AX #%u en %08X (tamaño %u)", s.frames, addr, size);
-    if (s.ax) s.ax->command_list(addr, uint16_t(size));
+    if (!s.ax) return;
+    const uint32_t before = s.ax->voices_processed();
+    s.ax->command_list(addr, uint16_t(size));
+    CACTUS_GRAFICA("DSP: voces AX activas", double(s.ax->voices_processed() - before));
 }
 
 void begin_upload() { s.uploading = true; s.upload_n = 0; }

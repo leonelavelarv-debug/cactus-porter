@@ -90,11 +90,41 @@ Hecho y probado en PC:
 
 Pendiente, por orden de bloqueo:
 
-1. **Pruebas en la consola** (ver «Plan de prueba en hardware»): nada de lo de arriba se ha corrido todavía en la RG35XX H ni con un disco real.
+1. **Pruebas en la consola** (ver «Plan de prueba en hardware» y «Medir el rendimiento con Tracy»): nada de lo de arriba se ha corrido todavía en la RG35XX H ni con un disco real.
 2. **WPAD, pruebas reales**: el adaptador Bluetooth emulado existe (ver arriba) pero solo se ha probado contra una pila HCI/L2CAP escrita aquí (`tests/wpad.sh`), no contra el SDK ni un juego. Sin verificar: orden de bytes de la MAC y el tamaño exacto de `BT.DINF` en SYSCONF, y la secuencia de conexión que espera WUD.
 3. **Validación del GX** del fork con juegos que no sean Galaxy (funciones del TEV o copias de EFB que Galaxy no usa).
 4. **REL**: archivos `.arc`/U8 con REL dentro, juegos con más de 8 MiB de REL (habría que agrupar los que no conviven) y REL cargados con `OSLinkFixed` que liberan su tabla de reubicación (aquí no importa: el host usa su propia copia).
 5. **Audio**: remuestreo polifásico (necesita la DROM del DSP), retardo inicial (ITD) y Dolby Pro Logic II, que tampoco tiene Dolphin. La respuesta de AX llega al instante: algún juego que espere un retraso (en Dolphin, The Clone Wars) podría colgarse.
+
+### Medir el rendimiento con Tracy
+
+[Tracy](https://github.com/wolfpld/tracy) está integrado como opción. `fetch` trae Tracy v0.15.0, y el visor del PC y el port tienen que ser exactamente de esa versión.
+
+```bash
+./cactus-porter.py fetch                          # una vez: fuentes/tracy (v0.15.0)
+./cactus-porter.py build --juego XXXX01 --tracy   # host con Tracy, en trabajo/XXXX01/build-host-tracy
+./cactus-porter.py package --juego XXXX01 --tracy # salida/<slug>-tracy.zip (el normal no cambia)
+```
+
+Instala `<slug>-tracy.zip` en la consola y abre el juego. El cliente funciona bajo demanda: escucha en el puerto 8086 y solo guarda datos mientras el PC esté conectado, así que sin captura apenas gasta. La consola y el PC tienen que estar en la misma red (Wi-Fi). La IP de la consola aparece en los ajustes de red de KNULLI.
+
+Captura automática desde el PC (Ubuntu o WSL):
+
+```bash
+./cactus-porter.py perf --juego XXXX01 --ip 192.168.1.50 --segundos 60
+```
+
+La primera vez compila `tracy-capture` y `tracy-csvexport` para el PC, y para eso necesita internet. Guarda la traza en `trabajo/XXXX01/perfiles/` y muestra un resumen:
+
+- cuadros: mediana, fps, p90 y p99;
+- **velocidad de la CPU emulada** (`CPU: % del retrace emulado`): por debajo de 100 % el juego va más lento que en la Wii;
+- cuadros con la cola de audio vacía (cortes de sonido);
+- tiempo de cada zona: CPU recompilada, GX, listas de AX y voces de Zelda, VI, eventos y mandos, y espera al retrace;
+- los últimos mensajes: microcódigo, módulos REL montados, conexión del Wiimote y topes de tiempo de la CPU.
+
+`perf --traza archivo.tracy` vuelve a resumir una traza ya guardada.
+
+Para verla gráficamente en Windows, descarga `Tracy-0.15.0.7z` de las releases de Tracy, abre `tracy-profiler.exe` y conéctate a la IP de la consola, o abre el `.tracy` guardado. El cliente también toma muestras de la pila. Como KNULLI corre como root, en «Statistics → Sampling» se ven las funciones recompiladas (`func_8xxxxxxx`) que más tiempo gastan, que son las candidatas a optimizar.
 
 ### Plan de prueba en hardware
 
@@ -128,4 +158,5 @@ dr="$PWD/fuentes/DolRecomp"; exe="$PWD/trabajo/dolrecomp-build/dolrecomp"
 ./tests/ax.sh                      # AX de Wii: lista con voces PCM16 en bucle y ADPCM, AUXA con callback, salida R/L y PB
 ./tests/zelda.sh                   # microcódigo Zelda (Galaxy): órdenes, sincronía, voces PCM/AFC, búferes L/R y VPB
 ./tests/rel.sh "$exe" "$dr"        # REL recompilados: DOL + dos módulos (Yaz0 y LZ11), importaciones entre ellos y recarga
+DOLRECOMP_DIR="$dr" ./tests/tracy.sh fuentes/tracy [tracy-capture tracy-csvexport]   # instrumentación; con las herramientas, captura por red y resumen
 ```

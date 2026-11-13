@@ -82,6 +82,21 @@ add_executable(${CACTUS_SLUG}-host
     $<TARGET_OBJECTS:cactus_game_cpu>)
 
 target_compile_definitions(${CACTUS_SLUG}-host PRIVATE CACTUS_GENERATED_HEADER="${game_id}.h")
+
+# ---------------- Tracy (pruebas de rendimiento, perfil.h) ----------------
+# cactus-porter build --tracy: cliente de Tracy en modo bajo demanda (solo mide con el visor conectado) y con
+# muestreo de pila, que en KNULLI (root) funciona. El visor del PC debe ser de la misma versión (TRACY_DIR).
+option(CACTUS_TRACY "Enlazar el cliente de Tracy para medir el rendimiento" OFF)
+set(TRACY_DIR "" CACHE PATH "Checkout de Tracy (misma versión que el visor del PC)")
+if(CACTUS_TRACY)
+    if(NOT EXISTS "${TRACY_DIR}/public/TracyClient.cpp")
+        message(FATAL_ERROR "CACTUS_TRACY=ON necesita -DTRACY_DIR=<checkout de Tracy> (cactus-porter fetch lo trae)")
+    endif()
+    target_sources(${CACTUS_SLUG}-host PRIVATE "${TRACY_DIR}/public/TracyClient.cpp")
+    target_include_directories(${CACTUS_SLUG}-host PRIVATE "${TRACY_DIR}/public")
+    target_compile_definitions(${CACTUS_SLUG}-host PRIVATE TRACY_ENABLE TRACY_ON_DEMAND TRACY_NO_FRAME_IMAGE)
+    message(STATUS "cactus-porter: Tracy activado (${TRACY_DIR})")
+endif()
 target_include_directories(${CACTUS_SLUG}-host PRIVATE
     "${GENERATED_DIR}"
     "${DOLRECOMP_DIR}/src"

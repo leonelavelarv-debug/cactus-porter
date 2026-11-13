@@ -18,7 +18,10 @@ SALIDA    = RAIZ / "salida"
 REPOS = {
     "DolRecomp":     "https://github.com/ExpansionPak/DolRecomp.git",
     "cactus-galaxy": "https://github.com/leonelavelarv-debug/cactus-galaxy.git",
+    "tracy":         "https://github.com/wolfpld/tracy.git",
 }
+# El visor de Tracy del PC y el cliente del port deben ser exactamente de la misma versión.
+TRACY_VERSION = "v0.15.0"
 
 def run(cmd, cwd=None, env=None, check=True, capture=False):
     cmd = [str(c) for c in cmd]
@@ -34,6 +37,7 @@ DEPS = FUENTES / "deps"
 
 def fork():  return FUENTES / "cactus-galaxy"
 def dolr():  return FUENTES / "DolRecomp"
+def tracy(): return FUENTES / "tracy"
 
 # ---------------------------------------------------------------- doctor
 def cmd_doctor(_):
@@ -46,6 +50,8 @@ def cmd_doctor(_):
         tiene = (FUENTES / nombre).is_dir()
         print(f"  [{'x' if tiene else ' '}] fuentes/{nombre} (fetch)")
         ok &= tiene
+    tiene = (tracy() / "public/TracyClient.cpp").is_file()
+    print(f"  [{'x' if tiene else ' '}] fuentes/tracy {TRACY_VERSION} (fetch; opcional: build --tracy y perf)")
     deps_ok = all((DEPS / d).is_dir() for d in ("glslang", "SPIRV-Cross"))
     print(f"  [{'x' if deps_ok else ' '}] fuentes/deps: glslang y SPIRV-Cross (instalar-entorno-nebula-v2.sh)")
     ok &= deps_ok
@@ -69,11 +75,15 @@ def cmd_fetch(_):
     FUENTES.mkdir(exist_ok=True)
     for nombre, url in REPOS.items():
         dst = FUENTES / nombre
-        branch = ["--branch", "rg35xxh-arm64"] if nombre == "cactus-galaxy" else []
+        branch = (["--branch", "rg35xxh-arm64"] if nombre == "cactus-galaxy" else
+                  ["--branch", TRACY_VERSION] if nombre == "tracy" else [])
         if not dst.exists():
             run(["git", "clone", "--depth", "1", *branch, url, dst])
         if nombre == "DolRecomp":
             run(["git", "submodule", "update", "--init", "--recursive"], cwd=dst)
+        elif nombre == "tracy":
+            if run(["git", "describe", "--tags", "--exact-match"], cwd=dst, capture=True, check=False).stdout.strip() != TRACY_VERSION:
+                print(f"Aviso: {dst} no está en {TRACY_VERSION}; el visor del PC debe ser de su misma versión.")
         elif run(["git", "branch", "--show-current"], cwd=dst, capture=True).stdout.strip() != "rg35xxh-arm64":
             sys.exit(f"!! Cambia {dst} a la rama rg35xxh-arm64 antes de compilar.")
     if not DEPS.is_dir():
@@ -289,6 +299,9 @@ def entorno_cross():
 
 def cmd_build(args):
     perfil = cargar_perfil(args.juego)
+    con_tracy = bool(getattr(args, "tracy", False))
+    if con_tracy and not (tracy() / "public/TracyClient.cpp").is_file():
+        sys.exit("!! falta fuentes/tracy: ejecuta ./cactus-porter.py fetch")
     dj = dir_juego(args.juego)
     env = entorno_cross()
     toolchain = fork()/"platform/knulli/aarch64-toolchain.cmake"
@@ -302,29 +315,35 @@ def cmd_build(args):
          f"-DCACTUS_SDL2_PREFIX={sdl}"], env=env)
     run(["cmake", "--build", bp], env=env)
     # 2) host: C generado + dr_cpu + glue, con el mismo toolchain
-    bh = dj / "build-host"
+    # Con --tracy, en su propia carpeta: el host normal no cambia.
+    bh = dj / ("build-host-tracy" if con_tracy else "build-host")
     run(["cmake", "-S", PLANTILLA/"host", "-B", bh, *gen,
          "-DCMAKE_BUILD_TYPE=Release", f"-DCMAKE_TOOLCHAIN_FILE={toolchain}",
          f"-DCACTUS_GALAXY_ROOT={fork()}", f"-DDOLRECOMP_DIR={dolr()}",
          f"-DGENERATED_DIR={dj/'recomp'/(perfil['id']+'_generated')}",
-         f"-DCACTUS_SLUG={perfil['slug']}", f"-DCACTUS_SDL2_PREFIX={sdl}"], env=env)
+         f"-DCACTUS_SLUG={perfil['slug']}", f"-DCACTUS_SDL2_PREFIX={sdl}",
+         f"-DCACTUS_TRACY={'ON' if con_tracy else 'OFF'}", f"-DTRACY_DIR={tracy()}"], env=env)
     run(["cmake", "--build", bh, "--target", f"{perfil['slug']}-host"], env=env)
-    print("\nEjecutables aarch64 listos (nebula-pak del juego, wrapper y host).")
+    print("\nEjecutables aarch64 listos (nebula-pak del juego, wrapper y host" +
+          (f", con Tracy {TRACY_VERSION}" if con_tracy else "") + ").")
 
 # ---------------------------------------------------------------- package
 def cmd_package(args):
     perfil = cargar_perfil(args.juego)
     dj = dir_juego(args.juego)
     slug, gid = perfil["slug"], perfil["id"]
-    puerto = dj / "puerto" / slug
+    con_tracy = bool(getattr(args, "tracy", False))
+    build_host = "build-host-tracy" if con_tracy else "build-host"
+    puerto = dj / ("puerto-tracy" if con_tracy else "puerto") / slug
     gd = puerto / slug
     shutil.rmtree(puerto, ignore_errors=True)
     gd.mkdir(parents=True)
     (gd / "gamedata").mkdir(); (gd / "nand").mkdir()
     for binario, src in [("nebula-pak", dj/"build-pak-perfil/nebula-pak"),
                          ("cactus-galaxy-wrapper", dj/"build-pak-perfil/cactus-galaxy-wrapper"),
-                         (f"{slug}-host", dj/f"build-host/{slug}-host")]:
-        if not src.exists(): sys.exit(f"!! falta {src}; ejecuta antes: build --juego {gid}")
+                         (f"{slug}-host", dj/build_host/f"{slug}-host")]:
+        if not src.exists():
+            sys.exit(f"!! falta {src}; ejecuta antes: build --juego {gid}" + (" --tracy" if con_tracy else ""))
         shutil.copy2(src, gd / binario); (gd / binario).chmod(0o755)
     lanzador = (PLANTILLA/"port/lanzador.sh").read_text()
     for k, v in [("@TITULO@", perfil["nombre"]), ("@ID@", gid), ("@SLUG@", slug)]:
@@ -347,11 +366,100 @@ def cmd_package(args):
         "El Cactus Galaxy Wrapper lo convierte a game.pak la primera vez, en esta consola.\n"
         "También vale tenerlo en roms/wii/. Nada de esto se distribuye con el port.\n")
     SALIDA.mkdir(exist_ok=True)
-    zip_path = SALIDA / f"{slug}.zip"
+    zip_path = SALIDA / (f"{slug}-tracy.zip" if con_tracy else f"{slug}.zip")
     with __import__("zipfile").ZipFile(zip_path, "w", __import__("zipfile").ZIP_DEFLATED) as z:
         for f in sorted(puerto.rglob("*")):
             if f.is_file(): z.write(f, f.relative_to(puerto))
     print(f"\nPort listo: {zip_path}\nInstálalo con PortMaster (KNULLI/muOS) y pon tu disco en ports/{slug}/gamedata/.")
+    if con_tracy:
+        print(f"Con Tracy {TRACY_VERSION}: abre el juego en la consola y, en el PC, "
+              f"./cactus-porter.py perf --juego {gid} --ip <IP de la consola> (o el visor tracy-profiler).")
+
+# ---------------------------------------------------------------- perf (Tracy)
+def herramientas_tracy():
+    """tracy-capture y tracy-csvexport para este PC, de la misma versión que el cliente del port."""
+    if not (tracy() / "capture").is_dir():
+        sys.exit("!! falta fuentes/tracy: ejecuta ./cactus-porter.py fetch")
+    gen = ["-G", "Ninja"] if shutil.which("ninja") else []
+    salida = {}
+    for prog, carpeta in (("tracy-capture", "capture"), ("tracy-csvexport", "csvexport")):
+        b = TRABAJO / "tracy-pc" / carpeta
+        exe = b / prog
+        if not exe.exists():
+            run(["cmake", "-S", tracy() / carpeta, "-B", b, *gen, "-DCMAKE_BUILD_TYPE=Release"])
+            run(["cmake", "--build", b, "--target", prog, "-j", str(os.cpu_count() or 4)])
+        salida[prog] = exe
+    return salida
+
+def _csv(exe, args, traza):
+    import csv, io
+    out = run([exe, *args, traza], capture=True, check=False).stdout
+    return list(csv.DictReader(io.StringIO(out)))
+
+def resumen_traza(csvexport, traza):
+    """Resumen legible de una captura: zonas, cuadros, gráficas y mensajes."""
+    import statistics
+    lineas = []
+    zonas = _csv(csvexport, [], traza)
+    marcos = _csv(csvexport, ["-F"], traza)
+    eventos = _csv(csvexport, ["-u", "-p"], traza)
+    mensajes = _csv(csvexport, ["-m"], traza)
+    nombres_zona = {z["name"] for z in zonas}
+    if marcos:
+        f = marcos[0]
+        # La mediana: el primer cuadro incluye la espera hasta que se conectó la captura.
+        mediana = float(f["median_ns"]) / 1e6
+        lineas.append(f"Cuadros: {f['frames']}, mediana {mediana:.2f} ms ({1000.0 / mediana if mediana else 0:.1f} fps), "
+                      f"p90 {float(f['p90_ns'])/1e6:.2f} ms, p99 {float(f['p99_ns'])/1e6:.2f} ms")
+    graficas = {}
+    for e in eventos:
+        if e.get("value") not in (None, "") and e["name"] not in nombres_zona and e["name"] != "Frame":
+            graficas.setdefault(e["name"], []).append(float(e["value"]))
+    if graficas:
+        lineas.append("")
+        lineas.append(f"{'Gráfica':42} {'media':>9} {'mín':>9} {'p10':>9} {'máx':>9}")
+        for nombre, v in sorted(graficas.items()):
+            o = sorted(v)
+            lineas.append(f"{nombre[:42]:42} {statistics.fmean(v):9.2f} {o[0]:9.2f} {o[len(o)//10]:9.2f} {o[-1]:9.2f}")
+    if zonas:
+        lineas.append("")
+        lineas.append(f"{'Zona':42} {'% del tiempo':>12} {'veces':>8} {'media ms':>9} {'peor ms':>9}")
+        for z in sorted(zonas, key=lambda z: -float(z["total_perc"])):
+            lineas.append(f"{z['name'][:42]:42} {float(z['total_perc']):12.1f} {int(z['counts']):8d} "
+                          f"{float(z['mean_ns'])/1e6:9.3f} {float(z['max_ns'])/1e6:9.3f}")
+    cpu = graficas.get("CPU: % del retrace emulado")
+    audio = graficas.get("audio en cola (ms)")
+    lineas.append("")
+    if cpu:
+        lineas.append(f"Velocidad de la CPU emulada: {statistics.fmean(cpu):.0f} % de una Wii de media "
+                      f"(peor 10 %: {sorted(cpu)[len(cpu)//10]:.0f} %). Por debajo de 100 % el juego va lento.")
+    if audio:
+        cortes = sum(1 for x in audio if x <= 0.5)
+        lineas.append(f"Audio: {cortes} de {len(audio)} cuadros con la cola de SDL vacía (cortes)." if cortes
+                      else "Audio: la cola de SDL nunca se vació.")
+    if mensajes:
+        lineas.append("")
+        lineas.append("Últimos mensajes:")
+        for m in mensajes[-15:]:
+            lineas.append(f"  {float(m['total_ns'])/1e9:8.2f} s  {m['MessageName']}")
+    return "\n".join(lineas)
+
+def cmd_perf(args):
+    """Captura el rendimiento de un port con Tracy desde el PC (la consola en la misma red)."""
+    import time
+    if not args.traza and not args.ip:
+        sys.exit("!! falta --ip (la IP de la consola, en KNULLI: Ajustes de red) o --traza <archivo.tracy>")
+    h = herramientas_tracy()
+    d = (dir_juego(args.juego) if args.juego else TRABAJO / "perfiles") / "perfiles"
+    d.mkdir(parents=True, exist_ok=True)
+    traza = Path(args.traza) if args.traza else d / time.strftime("%Y%m%d-%H%M%S.tracy")
+    if not args.traza:
+        print(f"Esperando al port en {args.ip}:{args.puerto} (ábrelo en la consola); se capturan {args.segundos} s.")
+        run([h["tracy-capture"], "-a", args.ip, "-p", str(args.puerto), "-o", traza, "-s", str(args.segundos), "-f"])
+    texto = resumen_traza(h["tracy-csvexport"], traza)
+    traza.with_suffix(".txt").write_text(texto + "\n")
+    print("\n" + texto)
+    print(f"\nTraza: {traza} (ábrela con tracy-profiler {TRACY_VERSION}); resumen: {traza.with_suffix('.txt')}")
 
 def cmd_all(args):
     a = argparse.Namespace(juego=cmd_probe(args), map=args.map, config=args.config)
@@ -367,11 +475,21 @@ def main():
         if nombre == "recomp":
             p.add_argument("--map", help="MAP del linker para símbolos legibles")
             p.add_argument("--config", help="config.toml de parches de DolRecomp")
+        else:
+            p.add_argument("--tracy", action="store_true",
+                           help=f"host con el cliente de Tracy {TRACY_VERSION} para medir el rendimiento")
+    p = sub.add_parser("perf", help="captura el rendimiento del port con Tracy (PC y consola en la misma red)")
+    p.add_argument("--juego", help="Title ID: la traza se guarda en trabajo/<ID>/perfiles")
+    p.add_argument("--ip", help="IP de la consola")
+    p.add_argument("--puerto", type=int, default=8086)
+    p.add_argument("--segundos", type=int, default=60)
+    p.add_argument("--traza", help="resumir una traza .tracy ya capturada en vez de capturar")
     p = sub.add_parser("all"); p.add_argument("--iso", required=True); p.add_argument("--region", default="USA")
     p.add_argument("--map"); p.add_argument("--config")
     args = ap.parse_args()
     {"doctor": cmd_doctor, "fetch": cmd_fetch, "probe": cmd_probe, "recomp": cmd_recomp,
-     "build": cmd_build, "package": cmd_package, "restore": cmd_restore, "all": cmd_all}[args.cmd](args)
+     "build": cmd_build, "package": cmd_package, "restore": cmd_restore, "all": cmd_all,
+     "perf": cmd_perf}[args.cmd](args)
 
 if __name__ == "__main__":
     main()

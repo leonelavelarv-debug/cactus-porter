@@ -19,6 +19,7 @@
 #include "dev_bt.h"
 #include "sysconf.h"
 #include "wii_rel.h"
+#include "perfil.h"
 #include "galaxy/input_bindings.h"
 #include "wii_boot.h"
 #include "wii_dvd.h"
@@ -132,9 +133,12 @@ static void open_audio(uint32_t rate) {
 }
 
 static void pump_audio() {
+    CACTUS_ZONA("audio: DMA a SDL");
     if (!g_audio || !(audio_dma.control & 0x8000) || !(audio_dma.control & 0x7fff)) return;
     const uint32_t target = (g_ai_rate / 30) * 4;
     uint32_t queued = SDL_GetQueuedAudioSize(g_audio);
+    // Lo que le queda a SDL por sonar: si llega a 0, el audio se corta (el juego no generó a tiempo).
+    CACTUS_GRAFICA("audio en cola (ms)", g_ai_rate ? double(queued) / 4.0 * 1000.0 / g_ai_rate : 0.0);
     bool finished = false;
     while (queued < target) {
         if (!audio_dma.left) {
@@ -441,13 +445,17 @@ int main(int argc, char** argv) {
 
   const double freq = double(SDL_GetPerformanceFrequency());
   const double period = boot.pal ? 1.0 / 50.0 : 1.0 / 60.0;
+  CACTUS_HILO("juego (CPU, GX, audio)");
+  CACTUS_MENSAJE("%s: DOL en %08x, %s, %zu REL", boot.pal ? "PAL" : "NTSC", entry, pak_path, rel::module_count());
+  Uint64 last_frame = SDL_GetPerformanceCounter();
   while (ok) {
     const Uint64 t0 = SDL_GetPerformanceCounter();
-    // Eventos y mandos los atiende la capa del fork; MENU/SELECT + Start pide salir.
-    galaxy::sdl::pump_events(0);
-    if (cactus::gx_quit_requested() || ios::kernel().shutdown_requested()) break;
-    bt->tick(read_pad(bt, float(period)));
     {
+      CACTUS_ZONA("eventos y mandos");
+      // Eventos y mandos los atiende la capa del fork; MENU/SELECT + Start pide salir.
+      galaxy::sdl::pump_events(0);
+      if (cactus::gx_quit_requested() || ios::kernel().shutdown_requested()) break;
+      bt->tick(read_pad(bt, float(period)));
       const auto pads = galaxy::sdl::input_state();
       for (size_t i = 0; i < pads.pads.size(); ++i)
         if (pads.pads[i].connected) { galaxy::sdl::rumble(pads.pad_ids[i], bt->rumble() ? 1.0f : 0.0f); break; }
@@ -455,10 +463,25 @@ int main(int argc, char** argv) {
     ok = cactus::game_frame(&g_cpu, g_pi_mask);
     if (!ok) break;
     pump_audio();
-    vi_update(true);
-    cactus::gx_frame(true, xfb_addr(g_vi));
-    const double left = period - double(SDL_GetPerformanceCounter() - t0) / freq;
-    if (left > 0.001) SDL_Delay(Uint32(left * 1000.0));
+    {
+      CACTUS_ZONA("VI");
+      vi_update(true);
+    }
+    {
+      CACTUS_ZONA("GX: dibujar el cuadro");
+      cactus::gx_frame(true, xfb_addr(g_vi));
+    }
+    const Uint64 t1 = SDL_GetPerformanceCounter();
+    const double work = double(t1 - t0) / freq;
+    CACTUS_GRAFICA("trabajo del cuadro (ms)", work * 1000.0);
+    CACTUS_GRAFICA("fps", double(t1 - last_frame) > 0 ? freq / double(t1 - last_frame) : 0.0);
+    last_frame = t1;
+    CACTUS_CUADRO();
+    const double left = period - work;
+    if (left > 0.001) {
+      CACTUS_ZONA("espera al retrace");
+      SDL_Delay(Uint32(left * 1000.0));
+    }
   }
   ppc_set_mem_write_journal(nullptr, nullptr);
   cactus::gx_shutdown();

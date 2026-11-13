@@ -2,6 +2,7 @@
 // conexión (petición de conexión del Wiimote, autenticación, L2CAP iniciado por la Wii) sigue lo que hace
 // la pila de WUD. Todo se contesta al instante: no hay radio.
 #include "dev_bt.h"
+#include "perfil.h"
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
@@ -112,6 +113,7 @@ void DevBt::command_status(uint16_t opcode) {
 void DevBt::connection_request() {
     request_sent_ = true;
     std::fprintf(stderr, "[bt] el Wiimote pide conectarse\n");
+    CACTUS_MENSAJE("WPAD: el Wiimote pide conectarse");
     Bytes p = hci_address(wpad::kAddress);
     p.insert(p.end(), kClassOfDevice, kClassOfDevice + 3);
     p.push_back(1);  // enlace ACL

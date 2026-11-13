@@ -7,6 +7,7 @@
 //  * PCM16 desde MRAM rellena el final con la última muestra donde Dolphin pisaba el principio del búfer;
 //  * el cifrado de GBA (comando 0C de Pikmin/Animal Crossing en GameCube) no está: se registra y se contesta.
 #include "zelda_hle.h"
+#include "perfil.h"
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -999,6 +1000,7 @@ void Ucode::send_ack(Ack type, u16 sync) {
 
 void Ucode::render_audio() {
     if (!rendering()) return;
+    CACTUS_ZONA("DSP: Zelda, voces");
     while (cur_frame_ < req_frames_) {
         if (cur_voice_ == 0) r_->PrepareFrame();
         const u16 voices = std::min<u16>(voices_per_frame_, u16(sync_skip_.size() << 4));

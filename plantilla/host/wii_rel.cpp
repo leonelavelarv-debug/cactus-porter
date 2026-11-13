@@ -4,6 +4,7 @@
 #include "wii_rel.h"
 #include "cactus_comprimidos.h"
 #include "guest_memory.h"
+#include "perfil.h"
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
@@ -165,6 +166,7 @@ bool relocate(const Module& m) {
 }
 
 void migrate(Module& m, uint32_t x) {
+    CACTUS_ZONA("REL: montar módulo");
     uint8_t* dst = wii::resolve(s.cpu, m.base, m.image.size());
     uint8_t* bss = m.bss_hi > m.bss_lo ? wii::resolve(s.cpu, m.bss_lo, m.bss_hi - m.bss_lo) : nullptr;
     if (!dst || (m.bss_hi > m.bss_lo && !bss)) {
@@ -177,6 +179,7 @@ void migrate(Module& m, uint32_t x) {
     wr32(x + 0x18, kMarker | (m.id & 0xFFFF));
     m.x = x;
     ++s.migrations;
+    CACTUS_MENSAJE("REL: módulo %u enlazado en %08X -> %08X", m.id, x, m.base);
     std::fprintf(stderr, "[rel] módulo %u (%s): el juego lo enlazó en %08X, se ejecuta recompilado en %08X\n",
                  m.id, m.path.c_str(), x, m.base);
 }
